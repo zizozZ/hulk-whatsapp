@@ -6,7 +6,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
     "express": "^4.19.2",
     "firebase-admin": "^12.5.0",
     "pino": "^9.4.0"
