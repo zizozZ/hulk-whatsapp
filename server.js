@@ -60,14 +60,15 @@ async function getWaVersion() {
   return fallback.version;
 }
 
-
 // ==================== HULK GEMINI AI & FIRESTORE AUTO-COACH ====================
-const humanPauseMap = new Map(); // يوقف البوت 2 ساعة إذا رد الكوتش يدوياً
-const chatMemoryMap = new Map(); // ذاكرة آخر 6 رسائل لكل محادثة
+const humanPauseMap = new Map();
+const chatMemoryMap = new Map();
 
 async function askHulkGemini(userPrompt, contextInfo, history = []) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim();
+  if (!apiKey) {
+    throw new Error('مفتاح GEMINI_API_KEY غير مضاف في إعدادات Environment Variables على Koyeb');
+  }
 
   const systemInstruction = `أنت المساعد الذكي الرسمي لكابتن هالك (كوتش زياد طارق - Cap Ziad) على واتساب ومنصة HULK FITNESS.
 أسلوبك: مصري رياضي، محفّز، ودود، محترف، ومختصر (3 إلى 5 سطور بالكتير إلا لو طلب شرح تمرين أو وجبة).
@@ -82,35 +83,46 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
     { role: 'user', parts: [{ text: userPrompt }] },
   ];
 
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents,
-          generationConfig: { temperature: 0.7, maxOutputTokens: 450 },
-        }),
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  let lastError = 'Unknown Gemini Error';
+
+  for (const model of models) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+            contents,
+            generationConfig: { temperature: 0.7, maxOutputTokens: 450 },
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        lastError = data?.error?.message || `HTTP ${res.status}`;
+        continue;
       }
-    );
-    const data = await res.json();
-    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return reply ? reply.trim() : null;
-  } catch (err) {
-    console.error('Gemini AI Error:', err?.message || err);
-    return null;
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (reply) return reply.trim();
+    } catch (err) {
+      lastError = err?.message || String(err);
+    }
   }
+
+  throw new Error(lastError);
 }
 
 async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
   try {
     if (!msg?.message || msg.key?.remoteJid === 'status@broadcast') return;
     const remoteJid = msg.key.remoteJid || '';
-    if (!remoteJid.endsWith('@s.whatsapp.net')) return; // تجاهل الجروبات
+    if (remoteJid.endsWith('@g.us')) return; // تجاهل الجروبات فقط
 
-    const senderPhone = normalizePhone(remoteJid.split('@')[0]);
+    const rawId = (msg.key.participant || remoteJid).split('@')[0];
+    const senderPhone = normalizePhone(rawId);
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -119,9 +131,8 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     const cleanText = text.trim();
     if (!cleanText) return;
 
-    const pauseKey = `${trainerId}_${senderPhone}`;
+    const pauseKey = `${trainerId}_${remoteJid}`;
 
-    // أوامر تحكم سريعة للكوتش
     if (msg.key.fromMe) {
       if (cleanText.toLowerCase() === '/ai off') {
         humanPauseMap.set(pauseKey, Date.now() + 24 * 60 * 60 * 1000);
@@ -131,16 +142,13 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
         humanPauseMap.delete(pauseKey);
         return;
       }
-      // إذا رد الكوتش بنفسه، يوقف الذكاء الاصطناعي لهذا العميل لمدة ساعتين
       humanPauseMap.set(pauseKey, Date.now() + 2 * 60 * 60 * 1000);
       return;
     }
 
-    // التحقق من عدم وجود إيقاف يدوي
     const pausedUntil = humanPauseMap.get(pauseKey) || 0;
     if (Date.now() < pausedUntil) return;
 
-    // البحث عن المتدرب في Firestore برقم هاتفه
     const traineesSnap = await db
       .collection('trainees')
       .where('trainerId', '==', trainerId)
@@ -149,7 +157,7 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     let matchedTraineeDoc = null;
     for (const d of traineesSnap.docs) {
       const tPhone = normalizePhone(d.data().phone || '');
-      if (tPhone && (tPhone === senderPhone || tPhone.endsWith(senderPhone.slice(-10)))) {
+      if (tPhone && senderPhone && (tPhone === senderPhone || tPhone.endsWith(senderPhone.slice(-10)))) {
         matchedTraineeDoc = d;
         break;
       }
@@ -160,7 +168,6 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
       const t = matchedTraineeDoc.data();
       contextInfo = `متدرب مشترك اسمه: ${t.fullName} | الهدف: ${t.goal || 'لياقة وبناء عضل'} | الوزن الحالي: ${t.currentWeight || 'غير محدد'} كجم | الوزن المستهدف: ${t.targetWeight || 'غير محدد'} كجم | حالة الاشتراك: ${t.subscriptionStatus || 'Active'}`;
 
-      // اكتشاف تحديث الوزن تلقائياً (مثلاً: وزني 78 أو وزني بقى 82.5)
       const weightMatch = cleanText.match(/(?:وزني|الوزن|وزن)[^0-9]{0,12}(\d{2,3}(?:\.\d{1,2})?)/i);
       if (weightMatch) {
         const newWeight = parseFloat(weightMatch[1]);
@@ -180,8 +187,7 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
           contextInfo += ` (تم تحديث وزنه الآن في الموقع إلى ${newWeight} كجم)`;
         }
       }
-    } else {
-      // تسجيل الزائر الجديد في قاعدة البيانات لمتابعته
+    } else if (senderPhone) {
       await db.collection('whatsappLeads').doc(senderPhone).set(
         {
           trainerId,
@@ -197,7 +203,6 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     const aiReply = await askHulkGemini(cleanText, contextInfo, history);
     if (!aiReply) return;
 
-    // تحديث ذاكرة المحادثة القصيرة
     const updatedHistory = [
       ...history.slice(-4),
       { role: 'user', text: cleanText },
@@ -205,7 +210,6 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     ];
     chatMemoryMap.set(pauseKey, updatedHistory);
 
-    // محاكاة الكتابة الطبيعية ثم الإرسال
     await sock.presenceSubscribe(remoteJid).catch(() => {});
     await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
     await sleep(Math.min(3500, Math.max(1500, aiReply.length * 25)));
@@ -348,7 +352,7 @@ async function processTrainerQueue(trainerId) {
       }
 
       if (!entry?.connected || !entry?.sock) {
-        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب غير متصلة' }).catch(() => {});
+        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب غير متصلة في السيرفر (أعد الربط)' }).catch(() => {});
         continue;
       }
 
@@ -413,7 +417,6 @@ async function processTrainerQueue(trainerId) {
   }
 }
 
-// مجدول التحفيز اليومي التلقائي ومتابعة المتغيبين (يعمل كل ساعة بين 10 صباحاً و 8 مساءً)
 async function runDailyMotivationScheduler() {
   const { hour } = getCairoTimeInfo();
   if (hour < 10 || hour > 20) return;
@@ -438,7 +441,6 @@ async function runDailyMotivationScheduler() {
         const firstName = String(t.fullName || 'بطل').split(' ')[0];
         const lastWorkoutMs = t.lastWorkoutAt?.toMillis ? t.lastWorkoutAt.toMillis() : 0;
         const daysSinceWorkout = lastWorkoutMs ? (Date.now() - lastWorkoutMs) / 86400000 : 4;
-
         let text = '';
         if (daysSinceWorkout >= 3) {
           text = pickRandom([
@@ -502,6 +504,16 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       const authDir = path.join(__dirname, 'auth_sessions', trainerId);
       if (fs.existsSync(authDir)) {
         await startWhatsAppSession(trainerId, data.phoneNumber || '', false, 0);
+      } else {
+        await db.collection('whatsappSessions').doc(trainerId).set(
+          {
+            status: 'disconnected',
+            pairingCode: null,
+            error: 'تمت إعادة تشغيل السيرفر على Koyeb، يرجى طلب كود الربط مرة أخرى.',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
       }
     }
   });
@@ -527,7 +539,31 @@ db.collection('whatsappQueue')
     });
   });
 
+// مستمع اختبار Gemini AI المباشر من لوحة المدرب
+db.collection('whatsappAiTests')
+  .where('status', '==', 'pending')
+  .onSnapshot((snap) => {
+    snap.docChanges().forEach(async (change) => {
+      if (change.type !== 'added') return;
+      const d = change.doc.data();
+      try {
+        const reply = await askHulkGemini(d.prompt || 'اهلا', 'اختبار من لوحة المدرب', []);
+        await change.doc.ref.update({ status: 'done', reply });
+      } catch (err) {
+        await change.doc.ref.update({ status: 'error', error: err?.message || 'AI Error' });
+      }
+    });
+  });
+
 const app = express();
-app.get('/', (_, res) => res.json({ status: 'HULK WhatsApp Web Service Running', version: '2.0.0-AI', activeSessions: sessions.size }));
+const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim());
+app.get('/', (_, res) =>
+  res.json({
+    status: 'HULK WhatsApp Web Service Running',
+    version: '2.1.0-AI',
+    aiConfigured: hasAiKey,
+    activeSessions: sessions.size,
+  })
+);
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v1.1.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.1.0 running on port ${PORT} | Gemini AI Key: ${hasAiKey ? 'OK' : 'MISSING'}`));
