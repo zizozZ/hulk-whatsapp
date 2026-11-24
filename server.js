@@ -31,10 +31,10 @@ const traineeCooldowns = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalizePhone(raw) {
-  let digits = String(raw || "").replace(/[^0-9]/g, "");
-  if (digits.startsWith("00")) digits = digits.slice(2);
-  if (digits.startsWith("01") && digits.length === 11) digits = "2" + digits;
-  return digits.replace(/^0+/, "");
+  let digits = String(raw || '').replace(/[^0-9]/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (digits.startsWith('01') && digits.length === 11) digits = '2' + digits;
+  return digits.replace(/^0+/, '');
 }
 
 function phonesMatch(p1, p2) {
@@ -335,7 +335,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: Browsers.macOS('Desktop'),
+    browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
@@ -363,37 +363,24 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
       setTimeout(async () => {
         try {
           if (sock.authState.creds.registered) return;
-          if (!cleanPhone || cleanPhone.length < 10) {
-            pairingLocks.delete(trainerId);
-            await db.collection("whatsappSessions").doc(trainerId).set(
-              { status: "error", error: "صيغة الرقم غير صحيحة، اكتب الرقم بكود الدولة مثل 2010xxxxxxxx", updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-              { merge: true }
-            );
-            return;
-          }
           const rawCode = await sock.requestPairingCode(cleanPhone);
-          const cleanCode = String(rawCode || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-          const formatted = cleanCode.match(/.{1,4}/g)?.join("-") || cleanCode;
-          await db.collection("whatsappSessions").doc(trainerId).set(
+          const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+          await db.collection('whatsappSessions').doc(trainerId).set(
             {
               trainerId,
               phoneNumber: cleanPhone,
-              status: "waiting_for_code",
+              status: 'waiting_for_code',
               pairingCode: formatted,
               error: null,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
           );
-        } catch (err) {
+        } catch {
           pairingCodeRequested = false;
           pairingLocks.delete(trainerId);
-          await db.collection("whatsappSessions").doc(trainerId).set(
-            { status: "error", error: "تعذر توليد كود الربط: " + (err?.message || "حاول مجدداً"), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-            { merge: true }
-          );
         }
-      }, 3000);
+      }, 1500);
     }
 
     if (connection === 'open') {
@@ -422,14 +409,22 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
       sessions.set(trainerId, { sock: null, connected: false, phoneNumber: cleanPhone, autoMotivationEnabled: curAuto });
 
       if (loggedOut) {
+        pairingLocks.delete(trainerId);
         fs.rmSync(authDir, { recursive: true, force: true });
         await db.collection('whatsappSessions').doc(trainerId).set(
           { status: 'disconnected', pairingCode: null, connectedNumber: null, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
           { merge: true }
         );
       } else if (requestPairing && !sock.authState.creds.registered) {
-        // لا نعيد بدء الجلسة أثناء انتظار إدخال الكود حتى لا يصبح الكود غير صالح
-        console.log("⏳ Waiting for user to enter pairing code on phone...");
+        if (retryCount < 3) {
+          setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, true, retryCount + 1), 2000);
+        } else {
+          pairingLocks.delete(trainerId);
+          await db.collection('whatsappSessions').doc(trainerId).set(
+            { status: 'error', error: 'تعذر توليد الكود، حاول مرة أخرى.', updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
+        }
       } else if (sock.authState.creds.registered) {
         setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, false, 0), 3000);
       }
@@ -457,7 +452,7 @@ async function processTrainerQueue(trainerId) {
       }
 
       if (!entry?.connected || !entry?.sock) {
-        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب تعيد الاتصال حالياً، حاول بعد ثوانٍ' }).catch(() => {});
+        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب غير متصلة في السيرفر' }).catch(() => {});
         continue;
       }
 
@@ -592,11 +587,12 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       existing.autoMotivationEnabled = data.autoMotivationEnabled;
     }
 
-    if (data.status === "pairing_requested") pairingLocks.delete(trainerId);
-    if ((data.status === "pairing_requested" || (data.status === "generating_code" && !existing)) && data.phoneNumber) {
-      await db.collection("whatsappSessions").doc(trainerId).update({ status: "generating_code" });
+    if (data.status === 'pairing_requested' && data.phoneNumber) {
+      pairingLocks.delete(trainerId);
+      await db.collection('whatsappSessions').doc(trainerId).update({ status: 'generating_code', pairingCode: null, error: null });
       await startWhatsAppSession(trainerId, data.phoneNumber, true, 0);
     } else if (data.status === 'disconnect_requested') {
+      pairingLocks.delete(trainerId);
       if (existing?.sock) {
         try { await existing.sock.logout(); } catch {}
       }
@@ -611,7 +607,6 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       if (fs.existsSync(authDir)) {
         await startWhatsAppSession(trainerId, data.phoneNumber || data.connectedNumber || '', false, 0);
       }
-      // لن يمسح الحالة في المنصة أبداً إذا أعيد تشغيل السيرفر، إلا عند الضغط على "فصل الربط" يدوياً
     }
   });
 });
@@ -656,10 +651,10 @@ const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_
 app.get('/', (_, res) =>
   res.json({
     status: 'HULK WhatsApp Web Service Running',
-    version: '2.4.0-SILENT-RECONNECT',
+    version: '2.5.0-LOCAL-AUTH',
     aiConfigured: hasAiKey,
     activeSessions: sessions.size,
   })
 );
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.4.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.5.0 running on port ${PORT}`));
