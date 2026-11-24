@@ -335,7 +335,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
     syncFullHistory: false,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
@@ -364,23 +364,26 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
         try {
           if (sock.authState.creds.registered) return;
           const rawCode = await sock.requestPairingCode(cleanPhone);
-          const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-          await db.collection('whatsappSessions').doc(trainerId).set(
+          const cleanCode = String(rawCode || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+          const formatted = cleanCode.match(/.{1,4}/g)?.join("-") || cleanCode;
+          console.log("🔑 Generated pairing code for", cleanPhone, ":", formatted);
+          await db.collection("whatsappSessions").doc(trainerId).set(
             {
               trainerId,
               phoneNumber: cleanPhone,
-              status: 'waiting_for_code',
+              status: "waiting_for_code",
               pairingCode: formatted,
               error: null,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
           );
-        } catch {
+        } catch (err) {
+          console.error("❌ requestPairingCode failed:", err?.message || err);
           pairingCodeRequested = false;
           pairingLocks.delete(trainerId);
         }
-      }, 1500);
+      }, 4000);
     }
 
     if (connection === 'open') {
