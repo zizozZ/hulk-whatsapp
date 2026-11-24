@@ -22,6 +22,17 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
+const recentLogs = [];
+function pushLog(level, msg, meta = null) {
+  const time = new Date().toLocaleTimeString("en-GB", { timeZone: "Africa/Cairo", hour12: false });
+  const entry = { time, level, msg, meta };
+  recentLogs.push(entry);
+  if (recentLogs.length > 120) recentLogs.shift();
+  const line = `[${time}] [${level}] ${msg}` + (meta ? " " + JSON.stringify(meta) : "");
+  if (level === "ERROR") console.error(line);
+  else console.log(line);
+}
+
 const sessions = new Map();
 const pairingLocks = new Set();
 const trainerQueues = new Map();
@@ -252,9 +263,9 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     incomingLocks.set(pauseKey, true);
 
     try {
-      console.log("📩 WA Incoming:", { remoteJid, participant: msg.key.participant, senderPn: msg.key.senderPn, senderPhone, pushName, text: cleanText });
+      pushLog("INFO", "Incoming WA message", { trainerId, remoteJid, senderPhone, pushName, text: cleanText });
       const { traineeDoc, contextText } = await buildFullTraineeContext(trainerId, senderPhone, pushName);
-      console.log("👤 Matched trainee:", traineeDoc ? { id: traineeDoc.id, fullName: traineeDoc.data().fullName, phone: traineeDoc.data().phone, trainerId: traineeDoc.data().trainerId } : null);
+      pushLog("INFO", "Trainee lookup", traineeDoc ? { id: traineeDoc.id, fullName: traineeDoc.data().fullName, phone: traineeDoc.data().phone } : { matched: false, senderPhone });
       let finalContext = contextText;
 
       if (traineeDoc) {
@@ -310,7 +321,7 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
       incomingLocks.delete(pauseKey);
     }
   } catch (err) {
-    console.error('Incoming WA AI handler error:', err?.message || err);
+    pushLog("ERROR", "Incoming WA AI error", { error: err?.message || String(err) });
   }
 }
 // ==============================================================================
@@ -368,7 +379,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
           const rawCode = await sock.requestPairingCode(cleanPhone);
           const cleanCode = String(rawCode || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
           const formatted = cleanCode.match(/.{1,4}/g)?.join("-") || cleanCode;
-          console.log("🔑 Generated pairing code for", cleanPhone, ":", formatted);
+          pushLog("INFO", "Generated pairing code", { trainerId, phone: cleanPhone, code: formatted });
           await db.collection("whatsappSessions").doc(trainerId).set(
             {
               trainerId,
@@ -381,7 +392,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
             { merge: true }
           );
         } catch (err) {
-          console.error("❌ requestPairingCode failed:", err?.message || err);
+          pushLog("ERROR", "requestPairingCode failed", { trainerId, phone: cleanPhone, error: err?.message || String(err) });
           pairingCodeRequested = false;
           pairingLocks.delete(trainerId);
         }
@@ -389,6 +400,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
     }
 
     if (connection === 'open') {
+      pushLog("INFO", "WhatsApp connected", { trainerId, phone: sock.user?.id?.split(':')[0] || cleanPhone });
       pairingLocks.delete(trainerId);
       const connectedNum = sock.user?.id?.split(':')[0] || cleanPhone;
       const curAuto = sessions.get(trainerId)?.autoMotivationEnabled ?? true;
@@ -408,6 +420,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
       );
       processTrainerQueue(trainerId);
     } else if (connection === 'close') {
+      pushLog("WARN", "WhatsApp connection closed", { trainerId, statusCode: lastDisconnect?.error?.output?.statusCode, loggedOut: lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut });
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       const curAuto = sessions.get(trainerId)?.autoMotivationEnabled ?? true;
@@ -652,14 +665,223 @@ db.collection('whatsappAiTests')
   });
 
 const app = express();
-const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim());
-app.get('/', (_, res) =>
-  res.json({
-    status: 'HULK WhatsApp Web Service Running',
-    version: '2.5.0-LOCAL-AUTH',
-    aiConfigured: hasAiKey,
-    activeSessions: sessions.size,
-  })
-);
+app.use(express.json());
+const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "").trim());
+
+async function collectSessionsOverview() {
+  const snap = await db.collection("whatsappSessions").get();
+  const list = [];
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const mem = sessions.get(doc.id);
+    list.push({
+      trainerId: doc.id,
+      phoneNumber: d.phoneNumber || mem?.phoneNumber || "-",
+      connectedNumber: d.connectedNumber || (mem?.connected ? mem?.phoneNumber : null) || "-",
+      status: mem?.connected ? "connected" : (d.status || "disconnected"),
+      pairingCode: d.pairingCode || null,
+      error: d.error || null,
+      inMemorySocket: Boolean(mem?.sock),
+      inMemoryConnected: Boolean(mem?.connected),
+      autoMotivationEnabled: typeof d.autoMotivationEnabled === "boolean" ? d.autoMotivationEnabled : true,
+    });
+  }
+  return list;
+}
+
+app.get("/api/status", async (_, res) => {
+  try {
+    const list = await collectSessionsOverview();
+    res.json({
+      ok: true,
+      version: "2.6.0-KOYEB-DASHBOARD",
+      aiConfigured: hasAiKey,
+      activeSessionsCount: Array.from(sessions.values()).filter((s) => s.connected).length,
+      sessions: list,
+      logs: recentLogs.slice().reverse(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/pair", async (req, res) => {
+  try {
+    const trainerId = String(req.body?.trainerId || "").trim();
+    const phone = normalizePhone(req.body?.phone || "");
+    if (!trainerId || phone.length < 10) {
+      return res.status(400).json({ ok: false, error: "أدخل trainerId ورقم هاتف صحيح بكود الدولة" });
+    }
+    pairingLocks.delete(trainerId);
+    pushLog("INFO", "Manual pair requested from Koyeb page", { trainerId, phone });
+    await db.collection("whatsappSessions").doc(trainerId).set(
+      {
+        trainerId,
+        phoneNumber: phone,
+        status: "generating_code",
+        pairingCode: null,
+        error: null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    startWhatsAppSession(trainerId, phone, true, 0);
+    res.json({ ok: true, message: "جاري توليد كود الربط..." });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/disconnect", async (req, res) => {
+  try {
+    const trainerId = String(req.body?.trainerId || "").trim();
+    if (!trainerId) return res.status(400).json({ ok: false, error: "trainerId مطلوب" });
+    pairingLocks.delete(trainerId);
+    const existing = sessions.get(trainerId);
+    if (existing?.sock) {
+      try { await existing.sock.logout(); } catch {}
+    }
+    fs.rmSync(path.join(__dirname, "auth_sessions", trainerId), { recursive: true, force: true });
+    sessions.delete(trainerId);
+    pushLog("WARN", "Disconnected from Koyeb page", { trainerId });
+    await db.collection("whatsappSessions").doc(trainerId).set(
+      { status: "disconnected", pairingCode: null, connectedNumber: null, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+app.get("/", (_, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HULK WhatsApp Koyeb Monitor</title>
+  <style>
+    body { margin: 0; font-family: Tahoma, Arial, sans-serif; background: #090d0a; color: #eef5ef; padding: 16px; }
+    .box { max-width: 900px; margin: 0 auto 16px; background: #111913; border: 1px solid #223326; border-radius: 12px; padding: 14px; }
+    h2 { margin: 0 0 10px; color: #39ff14; font-size: 18px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+    input, button { padding: 9px 12px; border-radius: 8px; border: 1px solid #2c4231; font-size: 13px; }
+    input { background: #0a0f0b; color: #fff; flex: 1; min-width: 160px; }
+    button { background: #39ff14; color: #071008; font-weight: bold; cursor: pointer; border: none; }
+    button.danger { background: #d9383a; color: #fff; }
+    button.secondary { background: #1e2d22; color: #d5e8d8; border: 1px solid #354f3b; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #1e2d22; padding: 8px; text-align: right; }
+    .badge { padding: 3px 8px; border-radius: 99px; font-size: 11px; font-weight: bold; }
+    .ok { background: rgba(57,255,20,0.16); color: #39ff14; }
+    .warn { background: rgba(255,193,7,0.16); color: #ffc107; }
+    .err { background: rgba(244,67,54,0.18); color: #ff6b6b; }
+    .code { font-family: monospace; font-size: 15px; background: #09130b; padding: 3px 8px; border-radius: 6px; border: 1px dashed #39ff14; color: #39ff14; }
+    .logs { background: #060907; border: 1px solid #1b291f; border-radius: 8px; padding: 10px; max-height: 360px; overflow-y: auto; font-family: monospace; font-size: 12px; direction: ltr; text-align: left; }
+    .log-line { padding: 3px 0; border-bottom: 1px dashed #131d16; white-space: pre-wrap; word-break: break-word; }
+    .INFO { color: #8ce99a; }
+    .WARN { color: #ffd43b; }
+    .ERROR { color: #ff6b6b; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>⚡ HULK FITNESS — مراقبة واتساب والربط واللوج (Koyeb)</h2>
+    <div id="topMeta" class="row" style="font-size:13px;color:#a8c2ad;">جاري التحميل...</div>
+    <div class="row">
+      <input id="trainerIdInput" placeholder="Trainer ID (مثال uid المدرب)" />
+      <input id="phoneInput" placeholder="رقم واتساب بكود الدولة (مثال 2010...)" />
+      <button onclick="pairNow()">ربط رقم / توليد كود</button>
+      <button class="secondary" onclick="refreshAll()">تحديث الآن</button>
+    </div>
+    <div id="actionMsg" style="font-size:12px;color:#39ff14;"></div>
+  </div>
+
+  <div class="box">
+    <h2>📱 الأرقام والجلسات المسجلة</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Trainer ID</th>
+          <th>الرقم</th>
+          <th>الحالة</th>
+          <th>كود الربط</th>
+          <th>تحكم</th>
+        </tr>
+      </thead>
+      <tbody id="sessionsBody"></tbody>
+    </table>
+  </div>
+
+  <div class="box">
+    <h2>📜 سجل اللوج المباشر (Live Logs)</h2>
+    <div id="logsBox" class="logs"></div>
+  </div>
+
+  <script>
+    async function refreshAll() {
+      try {
+        const res = await fetch("/api/status");
+        const data = await res.json();
+        if (!data.ok) return;
+        document.getElementById("topMeta").innerHTML =
+          "النسخة: <b>" + data.version + "</b> | Gemini Key: <b>" + (data.aiConfigured ? "مفعّل ✅" : "غير مضاف ❌") + "</b> | جلسات متصلة فعلياً: <b>" + data.activeSessionsCount + "</b>";
+
+        const tbody = document.getElementById("sessionsBody");
+        if (!data.sessions.length) {
+          tbody.innerHTML = "<tr><td colspan=5>لا توجد جلسات مسجلة بعد</td></tr>";
+        } else {
+          tbody.innerHTML = data.sessions.map(s => {
+            const cls = s.status === "connected" ? "ok" : (s.status === "error" ? "err" : "warn");
+            const num = s.connectedNumber && s.connectedNumber !== "-" ? s.connectedNumber : s.phoneNumber;
+            return "<tr>" +
+              "<td style=font-family:monospace;font-size:11px>" + s.trainerId + "</td>" +
+              "<td>" + (num || "-") + "</td>" +
+              "<td><span class=\"badge " + cls + "\">" + s.status + "</span>" + (s.error ? "<div style=color:#ff6b6b;font-size:11px>" + s.error + "</div>" : "") + "</td>" +
+              "<td>" + (s.pairingCode ? "<span class=code>" + s.pairingCode + "</span>" : "-") + "</td>" +
+              "<td><button class=danger onclick=\"disconnectId('" + s.trainerId + "')\">فصل</button></td>" +
+            "</tr>";
+          }).join("");
+        }
+
+        const logsEl = document.getElementById("logsBox");
+        logsEl.innerHTML = (data.logs || []).map(l =>
+          "<div class=\"log-line " + l.level + "\">[" + l.time + "] [" + l.level + "] " + l.msg + (l.meta ? " " + JSON.stringify(l.meta) : "") + "</div>"
+        ).join("");
+      } catch (e) {}
+    }
+
+    async function pairNow() {
+      const trainerId = document.getElementById("trainerIdInput").value.trim();
+      const phone = document.getElementById("phoneInput").value.trim();
+      const msgEl = document.getElementById("actionMsg");
+      msgEl.textContent = "جاري إرسال طلب الربط...";
+      const res = await fetch("/api/pair", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trainerId, phone })
+      });
+      const out = await res.json();
+      msgEl.textContent = out.ok ? (out.message || "تم الطلب") : ("خطأ: " + out.error);
+      setTimeout(refreshAll, 1500);
+    }
+
+    async function disconnectId(trainerId) {
+      await fetch("/api/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ trainerId })
+      });
+      refreshAll();
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 3000);
+  </script>
+</body>
+</html>`);
+});
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.5.0 running on port ${PORT}`));
+app.listen(PORT, () => pushLog("INFO", "HULK WhatsApp Web Backend running", { port: PORT, version: "2.6.0-KOYEB-DASHBOARD" }));
