@@ -89,68 +89,103 @@ const chatMemoryMap = new Map();
 const incomingLocks = new Map();
 
 async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
-  const traineesSnap = await db.collection('trainees').where('trainerId', '==', trainerId).get();
+  const cleanSender = normalizePhone(senderPhone);
+  const [traineesSnap, usersSnap] = await Promise.all([
+    db.collection("trainees").get().catch(() => ({ docs: [] })),
+    db.collection("users").get().catch(() => ({ docs: [] })),
+  ]);
+
+  const phoneMatchesAny = (obj) => {
+    if (!obj || !cleanSender) return false;
+    const candidates = [
+      obj.phone, obj.phoneNumber, obj.mobile, obj.whatsapp, obj.waPhone, obj.contactPhone
+    ].filter(Boolean);
+    return candidates.some((ph) => phonesMatch(ph, cleanSender));
+  };
+
   let matchedTraineeDoc = null;
+  let matchedUserDoc = null;
+
+  for (const u of usersSnap.docs) {
+    const uData = u.data() || {};
+    if (phoneMatchesAny(uData)) {
+      matchedUserDoc = u;
+      break;
+    }
+  }
+
   for (const d of traineesSnap.docs) {
-    const data = d.data();
-    if (phonesMatch(data.phone, senderPhone) || phonesMatch(data.whatsapp, senderPhone)) {
+    const tData = d.data() || {};
+    if (
+      phoneMatchesAny(tData) ||
+      (matchedUserDoc && (d.id === matchedUserDoc.id || tData.userId === matchedUserDoc.id || tData.uid === matchedUserDoc.id))
+    ) {
       matchedTraineeDoc = d;
       break;
     }
   }
 
-  if (!matchedTraineeDoc && senderPhone) {
-    const usersSnap = await db.collection('users').get();
-    for (const u of usersSnap.docs) {
-      const uData = u.data();
-      if (phonesMatch(uData.phone, senderPhone) || phonesMatch(uData.whatsapp, senderPhone)) {
-        const tDoc = await db.collection('trainees').doc(u.id).get();
-        if (tDoc.exists) {
-          matchedTraineeDoc = tDoc;
-          break;
-        }
-      }
-    }
-  }
-
-  if (!matchedTraineeDoc) {
-    return {
-      traineeDoc: null,
-      contextText: `حالة الشخص: زائر جديد غير مسجل كمتدرب بعد (اسمه على واتساب: ${pushName || 'غير معروف'} | رقمه: ${senderPhone}). رحّب به، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
+  // لو لقى مستخدم في users ومش موجود في trainees نعمله كيان متدرب من بيانات users
+  if (!matchedTraineeDoc && matchedUserDoc) {
+    const uData = matchedUserDoc.data() || {};
+    matchedTraineeDoc = {
+      id: matchedUserDoc.id,
+      ref: matchedUserDoc.ref,
+      data: () => ({ ...uData, fullName: uData.fullName || uData.name || uData.displayName || pushName }),
     };
   }
 
-  const t = matchedTraineeDoc.data();
+  if (!matchedTraineeDoc) {
+    if (typeof pushLog === "function") {
+      pushLog("WARN", "Trainee NOT matched", { trainerId, senderPhone: cleanSender, pushName, traineesCount: traineesSnap.size });
+    }
+    return {
+      traineeDoc: null,
+      contextText: `حالة الشخص: زائر جديد غير مسجل كمتدرب بعد (اسمه على واتساب: ${pushName || "غير معروف"} | رقمه: ${cleanSender || "غير ظاهر"}). رحّب به، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
+    };
+  }
+
+  const t = matchedTraineeDoc.data() || {};
   const traineeId = matchedTraineeDoc.id;
 
-  const [workoutsSnap, nutritionSnap, measurementsSnap] = await Promise.all([
-    db.collection('workoutPlans').where('traineeId', '==', traineeId).limit(1).get().catch(() => ({ docs: [] })),
-    db.collection('nutritionPlans').where('traineeId', '==', traineeId).limit(1).get().catch(() => ({ docs: [] })),
-    db.collection('bodyMeasurements').where('traineeId', '==', traineeId).limit(5).get().catch(() => ({ docs: [] })),
+  const [workoutsSnap, daysSnap, nutritionSnap, measurementsSnap] = await Promise.all([
+    db.collection("workoutPlans").where("traineeId", "==", traineeId).limit(3).get().catch(() => ({ docs: [] })),
+    db.collection("workoutDays").where("traineeId", "==", traineeId).limit(10).get().catch(() => ({ docs: [] })),
+    db.collection("nutritionPlans").where("traineeId", "==", traineeId).limit(2).get().catch(() => ({ docs: [] })),
+    db.collection("bodyMeasurements").where("traineeId", "==", traineeId).limit(5).get().catch(() => ({ docs: [] })),
   ]);
 
   const workoutPlan = workoutsSnap.docs[0]?.data();
+  const workoutDays = daysSnap.docs.map((d) => d.data());
   const nutritionPlan = nutritionSnap.docs[0]?.data();
   const measurements = measurementsSnap.docs.map((m) => m.data());
 
-  let summary = `بيانات المتدرب المسجل في المنصة:
-- الاسم: ${t.fullName || pushName || 'بطل'}
-- الهدف: ${t.goal || 'بناء عضل وتحسين الفورمة'}
-- الطول: ${t.height ? t.height + ' سم' : 'غير مسجل'}
-- الوزن البدائي: ${t.startWeight ? t.startWeight + ' كجم' : 'غير مسجل'}
-- الوزن الحالي: ${t.currentWeight ? t.currentWeight + ' كجم' : 'غير مسجل'}
-- الوزن المستهدف: ${t.targetWeight ? t.targetWeight + ' كجم' : 'غير مسجل'}
-- مستوى الالتزام: ${t.complianceLevel || 'ممتاز'}
-- حالة الاشتراك: ${t.subscriptionStatus || t.status || 'نشط'}`;
+  if (typeof pushLog === "function") {
+    pushLog("INFO", "Trainee MATCHED", { traineeId, name: t.fullName || t.name || pushName, phone: t.phone || t.phoneNumber });
+  }
+
+  let summary = `بيانات المتدرب المسجل رسمياً في المنصة (ممنوع معاملته كزائر نهائياً!):
+- الاسم: ${t.fullName || t.name || t.displayName || pushName || "بطل"}
+- الهدف: ${t.goal || "بناء عضل وتحسين الفورمة"}
+- الطول: ${t.height ? t.height + " سم" : "غير مسجل"}
+- الوزن البدائي: ${t.startWeight ? t.startWeight + " كجم" : "غير مسجل"}
+- الوزن الحالي: ${t.currentWeight ? t.currentWeight + " كجم" : "غير مسجل"}
+- الوزن المستهدف: ${t.targetWeight ? t.targetWeight + " كجم" : "غير مسجل"}
+- مستوى الالتزام: ${t.complianceLevel || "ممتاز"}
+- حالة الاشتراك: ${t.subscriptionStatus || t.status || "نشط"}`;
 
   if (workoutPlan) {
-    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.splitName || 'مخصص'} (${workoutPlan.daysPerWeek || ''} أيام أسبوعياً)`;
+    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.name || workoutPlan.splitName || "مخصص"} (${workoutPlan.daysPerWeek || ""} أيام أسبوعياً)`;
+  }
+  if (workoutDays.length > 0) {
+    const daysList = workoutDays.map((wd) => wd.title || wd.dayName || wd.name).filter(Boolean).join("، ");
+    if (daysList) summary += `\n- أيام/تقسيمة التمرين المسجلة: ${daysList}`;
   }
   if (nutritionPlan) {
-    summary += `\n- النظام الغذائي الحالي: ${nutritionPlan.targetCalories || nutritionPlan.calories || ''} سعرة حرارية (بروتين: ${nutritionPlan.protein || ''}جم)`;
+    summary += `\n- النظام الغذائي الحالي: ${nutritionPlan.targetCalories || nutritionPlan.calories || ""} سعرة حرارية (بروتين: ${nutritionPlan.protein || ""}جم)`;
   }
   if (measurements.length > 0) {
-    const weightsList = measurements.map((m) => m.weight).filter(Boolean).join(' -> ');
+    const weightsList = measurements.map((m) => m.weight).filter(Boolean).join(" -> ");
     if (weightsList) summary += `\n- سجل الأوزان المسجل: ${weightsList} كجم`;
   }
 
