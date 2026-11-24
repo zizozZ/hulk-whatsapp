@@ -31,10 +31,10 @@ const traineeCooldowns = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function normalizePhone(raw) {
-  let digits = String(raw || '').replace(/[^0-9]/g, '');
-  if (digits.startsWith('00')) digits = digits.slice(2);
-  if (digits.startsWith('01') && digits.length === 11) digits = '2' + digits;
-  return digits;
+  let digits = String(raw || "").replace(/[^0-9]/g, "");
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.startsWith("01") && digits.length === 11) digits = "2" + digits;
+  return digits.replace(/^0+/, "");
 }
 
 function phonesMatch(p1, p2) {
@@ -363,8 +363,17 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
       setTimeout(async () => {
         try {
           if (sock.authState.creds.registered) return;
+          if (!cleanPhone || cleanPhone.length < 10) {
+            pairingLocks.delete(trainerId);
+            await db.collection("whatsappSessions").doc(trainerId).set(
+              { status: "error", error: "صيغة الرقم غير صحيحة، اكتب الرقم بكود الدولة مثل 2010xxxxxxxx", updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+              { merge: true }
+            );
+            return;
+          }
           const rawCode = await sock.requestPairingCode(cleanPhone);
-          const formatted = rawCode?.match(/.{1,4}/g)?.join("-") || rawCode;
+          const cleanCode = String(rawCode || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+          const formatted = cleanCode.match(/.{1,4}/g)?.join("-") || cleanCode;
           await db.collection("whatsappSessions").doc(trainerId).set(
             {
               trainerId,
@@ -379,8 +388,12 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
         } catch (err) {
           pairingCodeRequested = false;
           pairingLocks.delete(trainerId);
+          await db.collection("whatsappSessions").doc(trainerId).set(
+            { status: "error", error: "تعذر توليد كود الربط: " + (err?.message || "حاول مجدداً"), updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
         }
-      }, 1500);
+      }, 3000);
     }
 
     if (connection === 'open') {
@@ -415,16 +428,9 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
           { merge: true }
         );
       } else if (requestPairing && !sock.authState.creds.registered) {
-        if (retryCount < 4) {
-          setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, true, retryCount + 1), 2000);
-        } else {
-          await db.collection('whatsappSessions').doc(trainerId).set(
-            { status: 'error', error: 'تعذر توليد كود الربط، حاول مرة أخرى.', updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-            { merge: true }
-          );
-        }
-      } else {
-        // إعادة الاتصال في الخلفية بصمت دون مسح حالة الربط من المنصة
+        // لا نعيد بدء الجلسة أثناء انتظار إدخال الكود حتى لا يصبح الكود غير صالح
+        console.log("⏳ Waiting for user to enter pairing code on phone...");
+      } else if (sock.authState.creds.registered) {
         setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, false, 0), 3000);
       }
     }
