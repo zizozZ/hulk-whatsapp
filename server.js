@@ -108,7 +108,6 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
   let matchedTraineeDoc = null;
 
   try {
-    // 1. لو الحساب مربوط مسبقاً في whatsappSenderMap
     if (remoteJid) {
       const mapSnap = await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).get().catch(() => null);
       if (mapSnap?.exists && mapSnap.data()?.traineeId) {
@@ -118,7 +117,6 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
       }
     }
 
-    // 2. مطابقة مباشرة بالرقم في trainees و users
     if (!matchedTraineeDoc && cleanSender) {
       const [traineesSnap, usersSnap] = await Promise.all([
         db.collection("trainees").get().catch(() => ({ docs: [] })),
@@ -156,7 +154,6 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
       }
     }
 
-    // 3. ربط فوري لو المتدرب ضغط زر الربط في صفحته خلال آخر 5 دقائق
     if (!matchedTraineeDoc && remoteJid) {
       const pendingSnap = await db.collection("whatsappPendingLinks").get().catch(() => ({ docs: [] }));
       const nowMs = Date.now();
@@ -187,7 +184,6 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
       }
     }
 
-    // حفظ الربط لأي مطابقة ناجحة مع تحديد trainerId تلقائياً
     if (matchedTraineeDoc && remoteJid && matchedTraineeDoc.id) {
       const tData = matchedTraineeDoc.data() || {};
       await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).set({
@@ -202,44 +198,90 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
   if (!matchedTraineeDoc) {
     return {
       traineeDoc: null,
-      contextText: `هذا الشخص غير مسجل في قاعدة بيانات المتدربين حالياً (الاسم الظاهر: ${pushName || "غير معروف"} | الرقم: ${cleanSender || "غير ظاهر"}). رحّب به بأسلوب كابتن هالك، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
+      contextText: `هذا الشخص غير مسجل في قاعدة بيانات المتدربين حالياً (الاسم الظاهر: ${pushName || "غير معروف"} | الرقم: ${cleanSender || "غير ظاهر"}). رحّب به باختصار بأسلوب كابتن هالك، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
     };
   }
 
   const t = matchedTraineeDoc.data() || {};
   const traineeId = matchedTraineeDoc.id;
 
-  const [workoutsSnap, nutritionSnap, measurementsSnap] = await Promise.all([
-    db.collection("workoutPlans").where("traineeId", "==", traineeId).limit(1).get().catch(() => ({ docs: [] })),
+  const [workoutsSnap, nutritionSnap, measurementsSnap, workoutLogsSnap, foodLogsSnap] = await Promise.all([
+    db.collection("workoutPlans").where("traineeId", "==", traineeId).limit(2).get().catch(() => ({ docs: [] })),
     db.collection("nutritionPlans").where("traineeId", "==", traineeId).limit(1).get().catch(() => ({ docs: [] })),
-    db.collection("bodyMeasurements").where("traineeId", "==", traineeId).limit(5).get().catch(() => ({ docs: [] })),
+    db.collection("bodyMeasurements").where("traineeId", "==", traineeId).limit(8).get().catch(() => ({ docs: [] })),
+    db.collection("workoutLogs").where("traineeId", "==", traineeId).limit(8).get().catch(() => ({ docs: [] })),
+    db.collection("foodLogs").where("traineeId", "==", traineeId).limit(5).get().catch(() => ({ docs: [] })),
   ]);
 
-  const workoutPlan = workoutsSnap.docs[0]?.data() || null;
+  const workoutPlan = (workoutsSnap.docs.map((d) => d.data()).find((p) => p.isActive)) || workoutsSnap.docs[0]?.data() || null;
   const nutritionPlan = nutritionSnap.docs[0]?.data() || null;
   const measurements = (measurementsSnap.docs || []).map((m) => m.data());
+  const workoutLogs = (workoutLogsSnap.docs || []).map((l) => l.data());
+  const foodLogs = (foodLogsSnap.docs || []).map((f) => f.data());
 
-  let summary = `⚠️ تنبيه حاسم: هذا الشخص متدرب مسجل بالفعل في المنصة وليس زائراً. يمنع منعاً باتاً الترحيب به كزائر أو سؤاله عن وزنه وطوله وهدفه أو عرض باقات الاشتراك عليه.
-بيانات المتدرب المسجل:
+  let summary = `متدرب مسجل (ممنوع الترحيب كزائر أو عرض باقات):
 - الاسم: ${t.fullName || t.name || pushName || "بطل"}
-- المدرب التابع له: ${t.trainerId || trainerId || "غير محدد"}
-- الهدف: ${t.goal || "بناء عضل وتحسين الفورمة"}
-- الطول: ${t.height ? t.height + " سم" : "غير مسجل"}
-- الوزن البدائي: ${t.startWeight ? t.startWeight + " كجم" : "غير مسجل"}
-- الوزن الحالي: ${t.currentWeight ? t.currentWeight + " كجم" : "غير مسجل"}
-- الوزن المستهدف: ${t.targetWeight ? t.targetWeight + " كجم" : "غير مسجل"}
-- مستوى الالتزام: ${t.complianceLevel || "ممتاز"}
-- حالة الاشتراك: ${t.subscriptionStatus || t.status || "نشط"}`;
+- الهدف: ${t.goal || "غير محدد"}
+- الوزن الحالي: ${t.currentWeight ? t.currentWeight + " كجم" : "غير مسجل"} | المستهدف: ${t.targetWeight ? t.targetWeight + " كجم" : "غير مسجل"} | الطول: ${t.height ? t.height + " سم" : "غير مسجل"}`;
 
   if (workoutPlan) {
-    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.splitName || "مخصص"} (${workoutPlan.daysPerWeek || ""} أيام أسبوعياً)`;
+    summary += `\n- الجدول: ${workoutPlan.title || workoutPlan.splitName || "مخصص"} (${workoutPlan.daysPerWeek || ""} أيام)`;
+    const rawDays = Array.isArray(workoutPlan.days)
+      ? workoutPlan.days
+      : Array.isArray(workoutPlan.workouts)
+      ? workoutPlan.workouts
+      : Array.isArray(workoutPlan.schedule)
+      ? workoutPlan.schedule
+      : (workoutPlan.days && typeof workoutPlan.days === "object" ? Object.values(workoutPlan.days) : []);
+
+    rawDays.slice(0, 7).forEach((dayItem, idx) => {
+      if (!dayItem || typeof dayItem !== "object") return;
+      const dayLabel = dayItem.title || dayItem.name || dayItem.dayName || (`اليوم ${idx + 1}`);
+      const exList = Array.isArray(dayItem.exercises)
+        ? dayItem.exercises
+        : Array.isArray(dayItem.items)
+        ? dayItem.items
+        : [];
+      const exNames = exList
+        .map((ex) => {
+          if (typeof ex === "string") return ex;
+          if (!ex || typeof ex !== "object") return "";
+          const n = ex.name || ex.title || ex.exerciseName || "";
+          const sets = ex.sets ? ` (${ex.sets}×${ex.reps || ""})` : "";
+          return n ? n + sets : "";
+        })
+        .filter(Boolean);
+      summary += exNames.length > 0 ? `\n  * ${dayLabel}: ${exNames.join("، ")}` : `\n  * ${dayLabel}`;
+    });
   }
+
   if (nutritionPlan) {
-    summary += `\n- النظام الغذائي الحالي: ${nutritionPlan.targetCalories || nutritionPlan.calories || ""} سعرة حرارية (بروتين: ${nutritionPlan.protein || ""}جم)`;
+    summary += `\n- التغذية: ${nutritionPlan.targetCalories || nutritionPlan.calories || ""} سعرة | بروتين: ${nutritionPlan.protein || ""}جم`;
   }
+
   if (measurements.length > 0) {
-    const weightsList = measurements.map((m) => m.weight).filter(Boolean).join(" -> ");
-    if (weightsList) summary += `\n- سجل الأوزان المسجل: ${weightsList} كجم`;
+    const weightsList = measurements
+      .map((m) => (m.weight ? `${m.weight} كجم${m.date ? " (" + m.date + ")" : ""}` : ""))
+      .filter(Boolean)
+      .slice(-6)
+      .join(" -> ");
+    if (weightsList) summary += `\n- سجل الأوزان: ${weightsList}`;
+  }
+
+  if (workoutLogs.length > 0) {
+    const logsText = workoutLogs
+      .slice(-5)
+      .map((l) => `${l.dayTitle || l.title || l.workoutName || "تمرين"}${l.date ? " [" + l.date + "]" : ""}`)
+      .join(" | ");
+    summary += `\n- سجل التمارين (Log): ${logsText}`;
+  }
+
+  if (foodLogs.length > 0) {
+    const foodText = foodLogs
+      .slice(-3)
+      .map((f) => `${f.date || "يوم"}: ${f.totalCalories || f.calories || 0} سعرة`)
+      .join(" | ");
+    summary += `\n- سجل الأكل (Log): ${foodText}`;
   }
 
   return { traineeDoc: matchedTraineeDoc, contextText: summary };
@@ -251,7 +293,9 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
     throw new Error('مفتاح GEMINI_API_KEY غير مضاف في إعدادات Koyeb');
   }
 
-  const systemInstruction = `أنت المساعد الذكي الرسمي لكابتن هالك (كوتش زياد طارق - Cap Ziad) على واتساب ومنصة HULK FITNESS.
+  const systemInstruction = `
+
+- أسلوب الرد: مختصر ومباشر جداً (بحد أقصى 4-6 أسطر أو نقاط قصيرة)، بدون مقدمات طويلة أو حماس زائد مكرر أو تكرار لنفس الكلام. أجب عن السؤال بالأرقام والأسماء المطلوبة مباشرة.أنت المساعد الذكي الرسمي لكابتن هالك (كوتش زياد طارق - Cap Ziad) على واتساب ومنصة HULK FITNESS.
 تحدث باللهجة المصرية الرياضية الودودة والمحفزة بأسلوب كابتن ذياد.
 
 معلومات الشخص الذي يراسلك الآن:
