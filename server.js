@@ -725,13 +725,75 @@ async function loadAllTrainersList() {
   return Array.from(map.values());
 }
 
+
+async function resolveTrainerIdentifier(inputRaw, phoneRaw) {
+  const raw = String(inputRaw || "").trim();
+  const cleanPhone = normalizePhone(phoneRaw || "");
+
+  // لو المستخدم كتب ID مطابق بالضبط في trainers أو users أو whatsappSessions
+  if (raw) {
+    const [tDoc, uDoc, sDoc] = await Promise.all([
+      db.collection("trainers").doc(raw).get().catch(() => null),
+      db.collection("users").doc(raw).get().catch(() => null),
+      db.collection("whatsappSessions").doc(raw).get().catch(() => null),
+    ]);
+    if (tDoc?.exists || uDoc?.exists || sDoc?.exists) {
+      return raw;
+    }
+  }
+
+  // البحث بالاسم أو البريد الإلكتروني أو رقم الهاتف في trainers و users
+  const [tSnap, uSnap] = await Promise.all([
+    db.collection("trainers").get().catch(() => ({ docs: [] })),
+    db.collection("users").get().catch(() => ({ docs: [] })),
+  ]);
+
+  const needle = raw.toLowerCase();
+
+  for (const d of tSnap.docs) {
+    const data = d.data() || {};
+    const name = String(data.fullName || data.name || data.displayName || data.brandName || "").toLowerCase();
+    const email = String(data.email || "").toLowerCase();
+    const tPhone = data.phone || data.phoneNumber || data.whatsapp || "";
+    if (
+      (needle && (name.includes(needle) || email === needle || d.id.toLowerCase() === needle)) ||
+      (cleanPhone && phonesMatch(tPhone, cleanPhone))
+    ) {
+      return d.id;
+    }
+  }
+
+  for (const d of uSnap.docs) {
+    const data = d.data() || {};
+    const r = String(data.role || "").toLowerCase();
+    if (r === "trainee") continue;
+    const name = String(data.fullName || data.name || data.displayName || "").toLowerCase();
+    const email = String(data.email || "").toLowerCase();
+    const uPhone = data.phone || data.phoneNumber || data.whatsapp || "";
+    if (
+      (needle && (name.includes(needle) || email === needle || d.id.toLowerCase() === needle)) ||
+      (cleanPhone && phonesMatch(uPhone, cleanPhone))
+    ) {
+      return d.id;
+    }
+  }
+
+  // لو كتب اسم مخصص للربط (مثلاً cap-ziad أو hulk-main) بدون حساب سابق، نستخدمه كمعرّف جلسة نظيف
+  if (raw) {
+    return raw.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 50) || "default_trainer";
+  }
+
+  return cleanPhone ? ("trainer_" + cleanPhone) : "default_trainer";
+}
+
 async function collectSessionsOverview() {
-  const snap = await db.collection("whatsappSessions").get();
-  const list = [];
+  const map = new Map();
+  const snap = await db.collection("whatsappSessions").get().catch(() => ({ docs: [] }));
+
   for (const doc of snap.docs) {
-    const d = doc.data();
+    const d = doc.data() || {};
     const mem = sessions.get(doc.id);
-    list.push({
+    map.set(doc.id, {
       trainerId: doc.id,
       phoneNumber: d.phoneNumber || mem?.phoneNumber || "-",
       connectedNumber: d.connectedNumber || (mem?.connected ? mem?.phoneNumber : null) || "-",
@@ -743,7 +805,47 @@ async function collectSessionsOverview() {
       autoMotivationEnabled: typeof d.autoMotivationEnabled === "boolean" ? d.autoMotivationEnabled : true,
     });
   }
-  return list;
+
+  // إضافة أي جلسات نشطة في الذاكرة لم تكن موجودة في جدول whatsappSessions
+  for (const [tid, mem] of sessions.entries()) {
+    if (!map.has(tid)) {
+      map.set(tid, {
+        trainerId: tid,
+        phoneNumber: mem?.phoneNumber || "-",
+        connectedNumber: mem?.connected ? (mem?.phoneNumber || "-") : "-",
+        status: mem?.connected ? "connected" : "active_in_memory",
+        pairingCode: null,
+        error: null,
+        inMemorySocket: Boolean(mem?.sock),
+        inMemoryConnected: Boolean(mem?.connected),
+        autoMotivationEnabled: mem?.autoMotivationEnabled ?? true,
+      });
+    }
+  }
+
+  // إضافة أي مجلدات جلسات محفوظة على القرص المحلي في auth_sessions
+  const authRoot = path.join(__dirname, "auth_sessions");
+  if (fs.existsSync(authRoot)) {
+    for (const folder of fs.readdirSync(authRoot)) {
+      const fullPath = path.join(authRoot, folder);
+      if (fs.statSync(fullPath).isDirectory() && !map.has(folder)) {
+        const mem = sessions.get(folder);
+        map.set(folder, {
+          trainerId: folder,
+          phoneNumber: mem?.phoneNumber || "-",
+          connectedNumber: mem?.connected ? (mem?.phoneNumber || "-") : "-",
+          status: mem?.connected ? "connected" : "cached_on_disk",
+          pairingCode: null,
+          error: null,
+          inMemorySocket: Boolean(mem?.sock),
+          inMemoryConnected: Boolean(mem?.connected),
+          autoMotivationEnabled: mem?.autoMotivationEnabled ?? true,
+        });
+      }
+    }
+  }
+
+  return Array.from(map.values());
 }
 
 app.get("/api/status", async (_, res) => {
@@ -765,10 +867,11 @@ app.get("/api/status", async (_, res) => {
 
 app.post("/api/pair", async (req, res) => {
   try {
-    const trainerId = String(req.body?.trainerId || "").trim();
+    const rawTrainer = String(req.body?.trainerId || req.body?.trainerName || "").trim();
+    const trainerId = await resolveTrainerIdentifier(rawTrainer, req.body?.phone || "");
     const phone = normalizePhone(req.body?.phone || "");
-    if (!trainerId || phone.length < 10) {
-      return res.status(400).json({ ok: false, error: "أدخل trainerId ورقم هاتف صحيح بكود الدولة" });
+    if (phone.length < 10) {
+      return res.status(400).json({ ok: false, error: "أدخل رقم هاتف صحيح بكود الدولة (مثال 2010...)" });
     }
     pairingLocks.delete(trainerId);
     pushLog("INFO", "Manual pair requested from Koyeb page", { trainerId, phone });
@@ -784,7 +887,7 @@ app.post("/api/pair", async (req, res) => {
       { merge: true }
     );
     startWhatsAppSession(trainerId, phone, true, 0);
-    res.json({ ok: true, message: "جاري توليد كود الربط..." });
+    res.json({ ok: true, trainerId, message: "جاري توليد كود الربط للمدرب: " + trainerId });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
@@ -850,7 +953,7 @@ app.get("/", (_, res) => {
     <div class="row">
       <select id="trainerSelect" onchange="onTrainerChange()" style="padding:9px 12px;border-radius:8px;border:1px solid #2c4231;background:#0a0f0b;color:#fff;font-size:13px;flex:1;min-width:190px;"><option value="">-- اختر المدرب --</option></select>
       <input id="phoneInput" placeholder="رقم واتساب بكود الدولة (مثال 2010...)" />
-      <input id="manualTrainerId" placeholder="أو اكتب Trainer ID يدوياً (اختياري)" />
+      <input id="manualTrainerId" placeholder="أو اكتب اسم المدرب / إيميله / اسم جلسة (بدون ID)" />
       <button onclick="pairNow()">ربط رقم / توليد كود</button>
       <button class="secondary" onclick="refreshAll()">تحديث الآن</button>
     </div>
@@ -922,7 +1025,7 @@ app.get("/", (_, res) => {
     async function pairNow() {
       const selVal = document.getElementById("trainerSelect").value.trim();
       const manualVal = (document.getElementById("manualTrainerId")?.value || "").trim();
-      const trainerId = manualVal || selVal;
+      const rawTrainerInput = manualVal || selVal;
       const phone = document.getElementById("phoneInput").value.trim();
       const msgEl = document.getElementById("actionMsg");
       msgEl.textContent = "جاري إرسال طلب الربط...";
