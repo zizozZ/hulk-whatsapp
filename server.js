@@ -83,7 +83,7 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
     { role: 'user', parts: [{ text: userPrompt }] },
   ];
 
-  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  const models = ['gemini-3.0-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
   let lastError = 'Unknown Gemini Error';
 
   for (const model of models) {
