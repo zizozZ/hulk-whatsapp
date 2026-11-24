@@ -23,6 +23,7 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const sessions = new Map();
+const pairingLocks = new Set();
 const trainerQueues = new Map();
 const dailyCounters = new Map();
 const traineeCooldowns = new Map();
@@ -356,8 +357,9 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if ((qr || connection === "connecting") && requestPairing && !sock.authState.creds.registered && !pairingCodeRequested) {
+    if (qr && requestPairing && !sock.authState.creds.registered && !pairingCodeRequested && !pairingLocks.has(trainerId)) {
       pairingCodeRequested = true;
+      pairingLocks.add(trainerId);
       setTimeout(async () => {
         try {
           if (sock.authState.creds.registered) return;
@@ -376,21 +378,13 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
           );
         } catch (err) {
           pairingCodeRequested = false;
-          if (retryCount >= 2) {
-            await db.collection("whatsappSessions").doc(trainerId).set(
-              {
-                status: "error",
-                error: "فشل توليد الكود من واتساب: " + (err?.message || "تأكد من صيغة الرقم بكود الدولة"),
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              },
-              { merge: true }
-            );
-          }
+          pairingLocks.delete(trainerId);
         }
-      }, 2500);
+      }, 1500);
     }
 
     if (connection === 'open') {
+      pairingLocks.delete(trainerId);
       const connectedNum = sock.user?.id?.split(':')[0] || cleanPhone;
       const curAuto = sessions.get(trainerId)?.autoMotivationEnabled ?? true;
       sessions.set(trainerId, { sock, connected: true, phoneNumber: connectedNum, autoMotivationEnabled: curAuto });
@@ -592,6 +586,7 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       existing.autoMotivationEnabled = data.autoMotivationEnabled;
     }
 
+    if (data.status === "pairing_requested") pairingLocks.delete(trainerId);
     if ((data.status === "pairing_requested" || (data.status === "generating_code" && !existing)) && data.phoneNumber) {
       await db.collection("whatsappSessions").doc(trainerId).update({ status: "generating_code" });
       await startWhatsAppSession(trainerId, data.phoneNumber, true, 0);
