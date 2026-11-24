@@ -49,35 +49,7 @@ function normalizePhone(raw) {
 }
 
 
-function collectAllPhonesFromObject(obj, depth = 0) {
-  const results = new Set();
-  if (!obj || typeof obj !== "object" || depth > 3) return [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (typeof v === "string" || typeof v === "number") {
-      if (/phone|mobile|wa|tel|contact/i.test(k) || /^\+?\d[\d\s-]{7,}$/.test(String(v).trim())) {
-        const norm = normalizePhone(String(v));
-        if (norm && norm.length >= 8) results.add(norm);
-      }
-    } else if (v && typeof v === "object" && !v._seconds && typeof v.toDate !== "function") {
-      for (const sub of collectAllPhonesFromObject(v, depth + 1)) {
-        results.add(sub);
-      }
-    }
-  }
-  return Array.from(results);
-}
 
-function deepPhoneMatch(candPhone, obj) {
-  const a = normalizePhone(candPhone);
-  if (!a || a.length < 8) return false;
-  const objPhones = collectAllPhonesFromObject(obj);
-  for (const b of objPhones) {
-    if (a === b) return true;
-    if (a.length >= 10 && b.length >= 10 && a.slice(-10) === b.slice(-10)) return true;
-    if (a.length >= 9 && b.length >= 9 && a.slice(-9) === b.slice(-9)) return true;
-  }
-  return false;
-}
 
 function phonesMatch(p1, p2) {
   const a = normalizePhone(p1);
@@ -119,97 +91,82 @@ const humanPauseMap = new Map();
 const chatMemoryMap = new Map();
 const incomingLocks = new Map();
 
-async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
-  const cleanSender = normalizePhone(senderPhone);
-  const [traineesSnap, usersSnap, subsSnap] = await Promise.all([
-    db.collection("trainees").get().catch(() => ({ docs: [] })),
-    db.collection("users").get().catch(() => ({ docs: [] })),
-    db.collection("subscriptions").get().catch(() => ({ docs: [] })),
-  ]);
+function isSamePhoneLoose(p1, p2) {
+  const a = String(p1 || "").replace(/[^0-9]/g, "").replace(/^00/, "");
+  const b = String(p2 || "").replace(/[^0-9]/g, "").replace(/^00/, "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const na = a.startsWith("01") && a.length === 11 ? "2" + a : a.replace(/^0+/, "");
+  const nb = b.startsWith("01") && b.length === 11 ? "2" + b : b.replace(/^0+/, "");
+  if (na === nb) return true;
+  if (na.length >= 9 && nb.length >= 9 && na.slice(-9) === nb.slice(-9)) return true;
+  return false;
+}
 
-  // البحث بالرقم في الاشتراكات إذا وُجد رقم مطابق مرتبط بـ traineeId
-  for (const s of subsSnap.docs) {
-    const sData = s.data() || {};
-    if (matchesPhoneList(sData) && sData.traineeId) {
-      const tDoc = await db.collection("trainees").doc(sData.traineeId).get().catch(() => null);
-      if (tDoc?.exists) {
-        await saveAutoLink(tDoc.id, tDoc.data() || {});
-        return tDoc;
+async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
+  const cleanSender = String(senderPhone || "").replace(/[^0-9]/g, "");
+  let matchedTraineeDoc = null;
+
+  try {
+    const [traineesSnap, usersSnap] = await Promise.all([
+      db.collection("trainees").get().catch(() => ({ docs: [] })),
+      db.collection("users").get().catch(() => ({ docs: [] })),
+    ]);
+
+    const getPhones = (d) => [d.phone, d.phoneNumber, d.mobile, d.whatsapp, d.waPhone, d.contactPhone].filter(Boolean);
+
+    let matchedUser = null;
+    for (const u of usersSnap.docs) {
+      const uData = u.data() || {};
+      if (getPhones(uData).some((ph) => isSamePhoneLoose(ph, cleanSender))) {
+        matchedUser = u;
+        break;
       }
     }
-  }
 
-  const phoneMatchesAny = (obj) => {
-    if (!obj || !cleanSender) return false;
-    const candidates = [
-      obj.phone, obj.phoneNumber, obj.mobile, obj.whatsapp, obj.waPhone, obj.contactPhone
-    ].filter(Boolean);
-    return candidates.some((ph) => phonesMatch(ph, cleanSender));
-  };
-
-  let matchedTraineeDoc = null;
-  let matchedUserDoc = null;
-
-  for (const u of usersSnap.docs) {
-    const uData = u.data() || {};
-    if (phoneMatchesAny(uData)) {
-      matchedUserDoc = u;
-      break;
+    for (const t of traineesSnap.docs) {
+      const tData = t.data() || {};
+      const byPhone = getPhones(tData).some((ph) => isSamePhoneLoose(ph, cleanSender));
+      const byUser = matchedUser && (t.id === matchedUser.id || tData.userId === matchedUser.id || tData.uid === matchedUser.id);
+      if (byPhone || byUser) {
+        matchedTraineeDoc = t;
+        break;
+      }
     }
-  }
 
-  for (const d of traineesSnap.docs) {
-    const tData = d.data() || {};
-    if (
-      phoneMatchesAny(tData) ||
-      (matchedUserDoc && (d.id === matchedUserDoc.id || tData.userId === matchedUserDoc.id || tData.uid === matchedUserDoc.id))
-    ) {
-      matchedTraineeDoc = d;
-      break;
+    if (!matchedTraineeDoc && matchedUser) {
+      const uData = matchedUser.data() || {};
+      matchedTraineeDoc = {
+        id: matchedUser.id,
+        ref: matchedUser.ref,
+        data: () => ({ ...uData, fullName: uData.fullName || uData.name || pushName || "بطل" }),
+      };
     }
-  }
-
-  // لو لقى مستخدم في users ومش موجود في trainees نعمله كيان متدرب من بيانات users
-  if (!matchedTraineeDoc && matchedUserDoc) {
-    const uData = matchedUserDoc.data() || {};
-    matchedTraineeDoc = {
-      id: matchedUserDoc.id,
-      ref: matchedUserDoc.ref,
-      data: () => ({ ...uData, fullName: uData.fullName || uData.name || uData.displayName || pushName }),
-    };
-  }
+  } catch {}
 
   if (!matchedTraineeDoc) {
-    if (typeof pushLog === "function") {
-      pushLog("WARN", "Trainee NOT matched", { trainerId, senderPhone: cleanSender, pushName, traineesCount: traineesSnap.size });
-    }
     return {
       traineeDoc: null,
-      contextText: `حالة الشخص: زائر جديد غير مسجل كمتدرب بعد (اسمه على واتساب: ${pushName || "غير معروف"} | رقمه: ${cleanSender || "غير ظاهر"}). رحّب به، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
+      contextText: `هذا الشخص غير مسجل في قاعدة بيانات المتدربين حالياً (الاسم الظاهر: ${pushName || "غير معروف"} | الرقم: ${cleanSender || "غير ظاهر"}). رحّب به بأسلوب كابتن هالك، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
     };
   }
 
   const t = matchedTraineeDoc.data() || {};
   const traineeId = matchedTraineeDoc.id;
 
-  const [workoutsSnap, daysSnap, nutritionSnap, measurementsSnap] = await Promise.all([
-    db.collection("workoutPlans").where("traineeId", "==", traineeId).limit(3).get().catch(() => ({ docs: [] })),
-    db.collection("workoutDays").where("traineeId", "==", traineeId).limit(10).get().catch(() => ({ docs: [] })),
-    db.collection("nutritionPlans").where("traineeId", "==", traineeId).limit(2).get().catch(() => ({ docs: [] })),
+  const [workoutsSnap, nutritionSnap, measurementsSnap] = await Promise.all([
+    db.collection("workoutPlans").where("traineeId", "==", traineeId).limit(1).get().catch(() => ({ docs: [] })),
+    db.collection("nutritionPlans").where("traineeId", "==", traineeId).limit(1).get().catch(() => ({ docs: [] })),
     db.collection("bodyMeasurements").where("traineeId", "==", traineeId).limit(5).get().catch(() => ({ docs: [] })),
   ]);
 
-  const workoutPlan = workoutsSnap.docs[0]?.data();
-  const workoutDays = daysSnap.docs.map((d) => d.data());
-  const nutritionPlan = nutritionSnap.docs[0]?.data();
-  const measurements = measurementsSnap.docs.map((m) => m.data());
+  const workoutPlan = workoutsSnap.docs[0]?.data() || null;
+  const nutritionPlan = nutritionSnap.docs[0]?.data() || null;
+  const measurements = (measurementsSnap.docs || []).map((m) => m.data());
 
-  if (typeof pushLog === "function") {
-    pushLog("INFO", "Trainee MATCHED", { traineeId, name: t.fullName || t.name || pushName, phone: t.phone || t.phoneNumber });
-  }
-
-  let summary = `بيانات المتدرب المسجل رسمياً في المنصة (ممنوع معاملته كزائر نهائياً!):
-- الاسم: ${t.fullName || t.name || t.displayName || pushName || "بطل"}
+  let summary = `⚠️ تنبيه حاسم: هذا الشخص متدرب مسجل بالفعل في المنصة وليس زائراً. يمنع منعاً باتاً الترحيب به كزائر أو سؤاله عن وزنه وطوله وهدفه أو عرض باقات الاشتراك عليه.
+بيانات المتدرب المسجل:
+- الاسم: ${t.fullName || t.name || pushName || "بطل"}
 - الهدف: ${t.goal || "بناء عضل وتحسين الفورمة"}
 - الطول: ${t.height ? t.height + " سم" : "غير مسجل"}
 - الوزن البدائي: ${t.startWeight ? t.startWeight + " كجم" : "غير مسجل"}
@@ -219,11 +176,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
 - حالة الاشتراك: ${t.subscriptionStatus || t.status || "نشط"}`;
 
   if (workoutPlan) {
-    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.name || workoutPlan.splitName || "مخصص"} (${workoutPlan.daysPerWeek || ""} أيام أسبوعياً)`;
-  }
-  if (workoutDays.length > 0) {
-    const daysList = workoutDays.map((wd) => wd.title || wd.dayName || wd.name).filter(Boolean).join("، ");
-    if (daysList) summary += `\n- أيام/تقسيمة التمرين المسجلة: ${daysList}`;
+    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.splitName || "مخصص"} (${workoutPlan.daysPerWeek || ""} أيام أسبوعياً)`;
   }
   if (nutritionPlan) {
     summary += `\n- النظام الغذائي الحالي: ${nutritionPlan.targetCalories || nutritionPlan.calories || ""} سعرة حرارية (بروتين: ${nutritionPlan.protein || ""}جم)`;
