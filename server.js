@@ -108,7 +108,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
   let matchedTraineeDoc = null;
 
   try {
-    // 1. لو الـ remoteJid مربوط مسبقاً في whatsappSenderMap
+    // 1. لو الحساب مربوط مسبقاً في whatsappSenderMap
     if (remoteJid) {
       const mapSnap = await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).get().catch(() => null);
       if (mapSnap?.exists && mapSnap.data()?.traineeId) {
@@ -119,7 +119,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
     }
 
     // 2. مطابقة مباشرة بالرقم في trainees و users
-    if (!matchedTraineeDoc) {
+    if (!matchedTraineeDoc && cleanSender) {
       const [traineesSnap, usersSnap] = await Promise.all([
         db.collection("trainees").get().catch(() => ({ docs: [] })),
         db.collection("users").get().catch(() => ({ docs: [] })),
@@ -156,7 +156,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
       }
     }
 
-    // 3. ربط فوري لو المتدرب ضغط زر "ربط واتساب" في صفحته خلال آخر 5 دقائق
+    // 3. ربط فوري لو المتدرب ضغط زر الربط في صفحته خلال آخر 5 دقائق
     if (!matchedTraineeDoc && remoteJid) {
       const pendingSnap = await db.collection("whatsappPendingLinks").get().catch(() => ({ docs: [] }));
       const nowMs = Date.now();
@@ -166,7 +166,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
         const createdMs = pData.requestedAt?.toMillis ? pData.requestedAt.toMillis() : (Number(pData.requestedAtMs) || 0);
         if (createdMs && nowMs - createdMs <= 5 * 60 * 1000 && pData.traineeId) {
           if (!latestPending || createdMs > latestPending.createdMs) {
-            latestPending = { doc: pd, traineeId: pData.traineeId, createdMs };
+            latestPending = { doc: pd, data: pData, traineeId: pData.traineeId, createdMs };
           }
         }
       }
@@ -174,10 +174,11 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
         const tDoc = await db.collection("trainees").doc(latestPending.traineeId).get().catch(() => null);
         if (tDoc?.exists) {
           matchedTraineeDoc = tDoc;
+          const resolvedTrainerId = tDoc.data()?.trainerId || latestPending.data?.trainerId || trainerId;
           await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).set({
             remoteJid,
             traineeId: tDoc.id,
-            trainerId: tDoc.data()?.trainerId || trainerId,
+            trainerId: resolvedTrainerId,
             linkedViaButton: true,
             linkedAt: admin.firestore.FieldValue.serverTimestamp(),
           }, { merge: true }).catch(() => {});
@@ -186,12 +187,13 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
       }
     }
 
-    // حفظ الربط لأي مطابقة ناجحة
+    // حفظ الربط لأي مطابقة ناجحة مع تحديد trainerId تلقائياً
     if (matchedTraineeDoc && remoteJid && matchedTraineeDoc.id) {
+      const tData = matchedTraineeDoc.data() || {};
       await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).set({
         remoteJid,
         traineeId: matchedTraineeDoc.id,
-        trainerId: matchedTraineeDoc.data()?.trainerId || trainerId,
+        trainerId: tData.trainerId || trainerId,
         linkedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true }).catch(() => {});
     }
@@ -220,6 +222,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
   let summary = `⚠️ تنبيه حاسم: هذا الشخص متدرب مسجل بالفعل في المنصة وليس زائراً. يمنع منعاً باتاً الترحيب به كزائر أو سؤاله عن وزنه وطوله وهدفه أو عرض باقات الاشتراك عليه.
 بيانات المتدرب المسجل:
 - الاسم: ${t.fullName || t.name || pushName || "بطل"}
+- المدرب التابع له: ${t.trainerId || trainerId || "غير محدد"}
 - الهدف: ${t.goal || "بناء عضل وتحسين الفورمة"}
 - الطول: ${t.height ? t.height + " سم" : "غير مسجل"}
 - الوزن البدائي: ${t.startWeight ? t.startWeight + " كجم" : "غير مسجل"}
@@ -241,6 +244,7 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJ
 
   return { traineeDoc: matchedTraineeDoc, contextText: summary };
 }
+
 async function askHulkGemini(userPrompt, contextInfo, history = []) {
   const apiKey = (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim();
   if (!apiKey) {
