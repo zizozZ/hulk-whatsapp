@@ -48,6 +48,37 @@ function normalizePhone(raw) {
   return digits.replace(/^0+/, '');
 }
 
+
+function collectAllPhonesFromObject(obj, depth = 0) {
+  const results = new Set();
+  if (!obj || typeof obj !== "object" || depth > 3) return [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === "string" || typeof v === "number") {
+      if (/phone|mobile|wa|tel|contact/i.test(k) || /^\+?\d[\d\s-]{7,}$/.test(String(v).trim())) {
+        const norm = normalizePhone(String(v));
+        if (norm && norm.length >= 8) results.add(norm);
+      }
+    } else if (v && typeof v === "object" && !v._seconds && typeof v.toDate !== "function") {
+      for (const sub of collectAllPhonesFromObject(v, depth + 1)) {
+        results.add(sub);
+      }
+    }
+  }
+  return Array.from(results);
+}
+
+function deepPhoneMatch(candPhone, obj) {
+  const a = normalizePhone(candPhone);
+  if (!a || a.length < 8) return false;
+  const objPhones = collectAllPhonesFromObject(obj);
+  for (const b of objPhones) {
+    if (a === b) return true;
+    if (a.length >= 10 && b.length >= 10 && a.slice(-10) === b.slice(-10)) return true;
+    if (a.length >= 9 && b.length >= 9 && a.slice(-9) === b.slice(-9)) return true;
+  }
+  return false;
+}
+
 function phonesMatch(p1, p2) {
   const a = normalizePhone(p1);
   const b = normalizePhone(p2);
@@ -90,10 +121,23 @@ const incomingLocks = new Map();
 
 async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
   const cleanSender = normalizePhone(senderPhone);
-  const [traineesSnap, usersSnap] = await Promise.all([
+  const [traineesSnap, usersSnap, subsSnap] = await Promise.all([
     db.collection("trainees").get().catch(() => ({ docs: [] })),
     db.collection("users").get().catch(() => ({ docs: [] })),
+    db.collection("subscriptions").get().catch(() => ({ docs: [] })),
   ]);
+
+  // البحث بالرقم في الاشتراكات إذا وُجد رقم مطابق مرتبط بـ traineeId
+  for (const s of subsSnap.docs) {
+    const sData = s.data() || {};
+    if (matchesPhoneList(sData) && sData.traineeId) {
+      const tDoc = await db.collection("trainees").doc(sData.traineeId).get().catch(() => null);
+      if (tDoc?.exists) {
+        await saveAutoLink(tDoc.id, tDoc.data() || {});
+        return tDoc;
+      }
+    }
+  }
 
   const phoneMatchesAny = (obj) => {
     if (!obj || !cleanSender) return false;
