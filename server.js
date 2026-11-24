@@ -6,7 +6,7 @@ const admin = require('firebase-admin');
 const baileys = require('@whiskeysockets/baileys');
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
-const { DisconnectReason, fetchLatestBaileysVersion, Browsers, initAuthCreds, BufferJSON, proto } = baileys;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = baileys;
 
 let serviceAccount = null;
 const keyPath = path.join(__dirname, 'serviceAccountKey.json');
@@ -21,80 +21,6 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-
-// ==================== FIRESTORE PERSISTENT AUTH STATE ====================
-async function useFirestoreAuthState(trainerId) {
-  const docRef = db.collection('whatsappAuthState').doc(trainerId);
-  const keysCol = docRef.collection('keys');
-
-  const snap = await docRef.get();
-  let creds;
-  if (snap.exists && snap.data().creds) {
-    creds = JSON.parse(snap.data().creds, BufferJSON.reviver);
-  } else {
-    creds = initAuthCreds();
-  }
-
-  const saveCreds = async () => {
-    await docRef.set({ creds: JSON.stringify(creds, BufferJSON.replacer), updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-  };
-
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const data = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              const keyId = `${type}-${id}`.replace(/\//g, '__');
-              const kSnap = await keysCol.doc(keyId).get();
-              if (kSnap.exists && kSnap.data().val) {
-                let value = JSON.parse(kSnap.data().val, BufferJSON.reviver);
-                if (type === 'app-state-sync-key' && value) {
-                  value = proto.Message.AppStateSyncKeyData.fromObject(value);
-                }
-                data[id] = value;
-              }
-            })
-          );
-          return data;
-        },
-        set: async (data) => {
-          const batch = db.batch();
-          let ops = 0;
-          for (const category in data) {
-            for (const id in data[category]) {
-              const value = data[category][id];
-              const keyId = `${category}-${id}`.replace(/\//g, '__');
-              const kRef = keysCol.doc(keyId);
-              if (value) {
-                batch.set(kRef, { val: JSON.stringify(value, BufferJSON.replacer) });
-              } else {
-                batch.delete(kRef);
-              }
-              ops++;
-              if (ops >= 400) {
-                await batch.commit();
-                ops = 0;
-              }
-            }
-          }
-          if (ops > 0) await batch.commit();
-        },
-      },
-    },
-    saveCreds,
-    clearAuth: async () => {
-      const allKeys = await keysCol.get();
-      const batch = db.batch();
-      allKeys.docs.forEach((d) => batch.delete(d.ref));
-      batch.delete(docRef);
-      await batch.commit().catch(() => {});
-    },
-  };
-}
-// =========================================================================
 
 const sessions = new Map();
 const trainerQueues = new Map();
@@ -388,19 +314,19 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
 
 async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = false, retryCount = 0) {
   const cleanPhone = normalizePhone(phoneNumber);
-  const authHelper = await useFirestoreAuthState(trainerId);
+  const authDir = path.join(__dirname, 'auth_sessions', trainerId);
 
-  if (requestPairing && retryCount === 0) {
-    await authHelper.clearAuth();
+  if (requestPairing && retryCount === 0 && fs.existsSync(authDir)) {
+    fs.rmSync(authDir, { recursive: true, force: true });
   }
-
-  const { state, saveCreds, clearAuth } = await useFirestoreAuthState(trainerId);
+  fs.mkdirSync(authDir, { recursive: true });
 
   const oldEntry = sessions.get(trainerId);
   if (oldEntry?.sock) {
     try { oldEntry.sock.end(); } catch {}
   }
 
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const version = await getWaVersion();
 
   const sock = makeWASocket({
@@ -416,7 +342,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
   });
 
   const prevAuto = oldEntry?.autoMotivationEnabled ?? true;
-  sessions.set(trainerId, { sock, connected: false, phoneNumber: cleanPhone, autoMotivationEnabled: prevAuto, clearAuth });
+  sessions.set(trainerId, { sock, connected: false, phoneNumber: cleanPhone, autoMotivationEnabled: prevAuto });
 
   let pairingCodeRequested = false;
   sock.ev.on('creds.update', saveCreds);
@@ -456,7 +382,7 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
     if (connection === 'open') {
       const connectedNum = sock.user?.id?.split(':')[0] || cleanPhone;
       const curAuto = sessions.get(trainerId)?.autoMotivationEnabled ?? true;
-      sessions.set(trainerId, { sock, connected: true, phoneNumber: connectedNum, autoMotivationEnabled: curAuto, clearAuth });
+      sessions.set(trainerId, { sock, connected: true, phoneNumber: connectedNum, autoMotivationEnabled: curAuto });
       await db.collection('whatsappSessions').doc(trainerId).set(
         {
           trainerId,
@@ -475,23 +401,26 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       const curAuto = sessions.get(trainerId)?.autoMotivationEnabled ?? true;
-      sessions.set(trainerId, { sock: null, connected: false, phoneNumber: cleanPhone, autoMotivationEnabled: curAuto, clearAuth });
+      sessions.set(trainerId, { sock: null, connected: false, phoneNumber: cleanPhone, autoMotivationEnabled: curAuto });
 
       if (loggedOut) {
-        await clearAuth();
+        fs.rmSync(authDir, { recursive: true, force: true });
         await db.collection('whatsappSessions').doc(trainerId).set(
           { status: 'disconnected', pairingCode: null, connectedNumber: null, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
           { merge: true }
         );
-      } else if (statusCode === DisconnectReason.restartRequired || sock.authState.creds.registered) {
-        setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, false, 0), 1500);
-      } else if (requestPairing && retryCount < 3) {
-        setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, true, retryCount + 1), 2000);
+      } else if (requestPairing && !sock.authState.creds.registered) {
+        if (retryCount < 4) {
+          setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, true, retryCount + 1), 2000);
+        } else {
+          await db.collection('whatsappSessions').doc(trainerId).set(
+            { status: 'error', error: 'تعذر توليد كود الربط، حاول مرة أخرى.', updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+            { merge: true }
+          );
+        }
       } else {
-        await db.collection('whatsappSessions').doc(trainerId).set(
-          { status: 'error', error: 'تعذر إكمال الاتصال بواتساب، حاول مرة أخرى.', updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-          { merge: true }
-        );
+        // إعادة الاتصال في الخلفية بصمت دون مسح حالة الربط من المنصة
+        setTimeout(() => startWhatsAppSession(trainerId, cleanPhone, false, 0), 3000);
       }
     }
   });
@@ -517,7 +446,7 @@ async function processTrainerQueue(trainerId) {
       }
 
       if (!entry?.connected || !entry?.sock) {
-        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب غير متصلة في السيرفر (أعد الربط)' }).catch(() => {});
+        await msg.ref.update({ status: 'failed', error: 'جلسة واتساب تعيد الاتصال حالياً، حاول بعد ثوانٍ' }).catch(() => {});
         continue;
       }
 
@@ -659,29 +588,18 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       if (existing?.sock) {
         try { await existing.sock.logout(); } catch {}
       }
-      if (existing?.clearAuth) await existing.clearAuth();
+      fs.rmSync(path.join(__dirname, 'auth_sessions', trainerId), { recursive: true, force: true });
       sessions.delete(trainerId);
       await db.collection('whatsappSessions').doc(trainerId).set(
         { status: 'disconnected', pairingCode: null, connectedNumber: null, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
     } else if (data.status === 'connected' && !existing) {
-      // استرجاع الجلسة المحفوظة في Firestore تلقائياً بعد أي تحديث أو إعادة تشغيل للسيرفر!
-      const authSnap = await db.collection('whatsappAuthState').doc(trainerId).get();
-      if (authSnap.exists && authSnap.data().creds) {
-        console.log(`♻️ Restoring WhatsApp session from Firestore for trainer: ${trainerId}`);
+      const authDir = path.join(__dirname, 'auth_sessions', trainerId);
+      if (fs.existsSync(authDir)) {
         await startWhatsAppSession(trainerId, data.phoneNumber || data.connectedNumber || '', false, 0);
-      } else {
-        await db.collection('whatsappSessions').doc(trainerId).set(
-          {
-            status: 'disconnected',
-            pairingCode: null,
-            error: 'يرجى ربط رقم واتساب مرة واحدة لحفظ الجلسة سحابياً بشكل دائم.',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
       }
+      // لن يمسح الحالة في المنصة أبداً إذا أعيد تشغيل السيرفر، إلا عند الضغط على "فصل الربط" يدوياً
     }
   });
 });
@@ -726,10 +644,10 @@ const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_
 app.get('/', (_, res) =>
   res.json({
     status: 'HULK WhatsApp Web Service Running',
-    version: '2.3.0-CLOUD-AUTH',
+    version: '2.4.0-SILENT-RECONNECT',
     aiConfigured: hasAiKey,
     activeSessions: sessions.size,
   })
 );
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.3.0 running on port ${PORT} | Cloud Session Sync: ON`));
+app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.4.0 running on port ${PORT}`));
