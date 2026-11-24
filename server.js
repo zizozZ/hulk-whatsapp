@@ -677,33 +677,46 @@ async function loadAllTrainersList() {
     db.collection("whatsappSessions").get().catch(() => ({ docs: [] })),
   ]);
 
+  for (const d of tSnap.docs) {
+    const data = d.data() || {};
+    map.set(d.id, {
+      id: d.id,
+      name: data.fullName || data.name || data.displayName || data.brandName || "مدرب (" + d.id.slice(0, 6) + ")",
+      phone: data.phone || data.phoneNumber || data.whatsapp || "",
+    });
+  }
+
   for (const d of uSnap.docs) {
-    const data = d.data();
-    if (data.role === "trainer" || data.role === "admin") {
+    const data = d.data() || {};
+    const r = String(data.role || "").toLowerCase();
+    if (r === "trainer" || r === "coach" || r === "admin" || map.has(d.id)) {
+      const prev = map.get(d.id) || {};
       map.set(d.id, {
         id: d.id,
-        name: data.fullName || data.name || data.displayName || data.email || d.id,
+        name: data.fullName || data.name || data.displayName || prev.name || "مدرب (" + d.id.slice(0, 6) + ")",
+        phone: data.phone || data.phoneNumber || data.whatsapp || prev.phone || "",
+      });
+    }
+  }
+
+  // لو لسه فاضي، أضف كل مستخدمي users كاحتياط عشان متبقاش القائمة فاضية أبداً
+  if (map.size === 0) {
+    for (const d of uSnap.docs) {
+      const data = d.data() || {};
+      map.set(d.id, {
+        id: d.id,
+        name: (data.fullName || data.name || data.email || d.id) + (data.role ? " [" + data.role + "]" : ""),
         phone: data.phone || data.phoneNumber || data.whatsapp || "",
       });
     }
   }
 
-  for (const d of tSnap.docs) {
-    const data = d.data();
-    const prev = map.get(d.id) || { id: d.id, name: d.id, phone: "" };
-    map.set(d.id, {
-      id: d.id,
-      name: data.fullName || data.name || data.displayName || data.brandName || prev.name || d.id,
-      phone: data.phone || data.phoneNumber || data.whatsapp || prev.phone || "",
-    });
-  }
-
   for (const d of sSnap.docs) {
-    const data = d.data();
+    const data = d.data() || {};
     if (!map.has(d.id)) {
       map.set(d.id, {
         id: d.id,
-        name: data.trainerName || d.id,
+        name: data.trainerName || ("مدرب (" + d.id.slice(0, 6) + ")"),
         phone: data.phoneNumber || data.connectedNumber || "",
       });
     }
@@ -837,6 +850,7 @@ app.get("/", (_, res) => {
     <div class="row">
       <select id="trainerSelect" onchange="onTrainerChange()" style="padding:9px 12px;border-radius:8px;border:1px solid #2c4231;background:#0a0f0b;color:#fff;font-size:13px;flex:1;min-width:190px;"><option value="">-- اختر المدرب --</option></select>
       <input id="phoneInput" placeholder="رقم واتساب بكود الدولة (مثال 2010...)" />
+      <input id="manualTrainerId" placeholder="أو اكتب Trainer ID يدوياً (اختياري)" />
       <button onclick="pairNow()">ربط رقم / توليد كود</button>
       <button class="secondary" onclick="refreshAll()">تحديث الآن</button>
     </div>
@@ -906,7 +920,9 @@ app.get("/", (_, res) => {
       if (m && m[1]) pInp.value = m[1].trim();
     }
     async function pairNow() {
-      const trainerId = document.getElementById("trainerSelect").value.trim();
+      const selVal = document.getElementById("trainerSelect").value.trim();
+      const manualVal = (document.getElementById("manualTrainerId")?.value || "").trim();
+      const trainerId = manualVal || selVal;
       const phone = document.getElementById("phoneInput").value.trim();
       const msgEl = document.getElementById("actionMsg");
       msgEl.textContent = "جاري إرسال طلب الربط...";
