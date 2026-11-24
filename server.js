@@ -668,6 +668,50 @@ const app = express();
 app.use(express.json());
 const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || "").trim());
 
+
+async function loadAllTrainersList() {
+  const map = new Map();
+  const [tSnap, uSnap, sSnap] = await Promise.all([
+    db.collection("trainers").get().catch(() => ({ docs: [] })),
+    db.collection("users").get().catch(() => ({ docs: [] })),
+    db.collection("whatsappSessions").get().catch(() => ({ docs: [] })),
+  ]);
+
+  for (const d of uSnap.docs) {
+    const data = d.data();
+    if (data.role === "trainer" || data.role === "admin") {
+      map.set(d.id, {
+        id: d.id,
+        name: data.fullName || data.name || data.displayName || data.email || d.id,
+        phone: data.phone || data.phoneNumber || data.whatsapp || "",
+      });
+    }
+  }
+
+  for (const d of tSnap.docs) {
+    const data = d.data();
+    const prev = map.get(d.id) || { id: d.id, name: d.id, phone: "" };
+    map.set(d.id, {
+      id: d.id,
+      name: data.fullName || data.name || data.displayName || data.brandName || prev.name || d.id,
+      phone: data.phone || data.phoneNumber || data.whatsapp || prev.phone || "",
+    });
+  }
+
+  for (const d of sSnap.docs) {
+    const data = d.data();
+    if (!map.has(d.id)) {
+      map.set(d.id, {
+        id: d.id,
+        name: data.trainerName || d.id,
+        phone: data.phoneNumber || data.connectedNumber || "",
+      });
+    }
+  }
+
+  return Array.from(map.values());
+}
+
 async function collectSessionsOverview() {
   const snap = await db.collection("whatsappSessions").get();
   const list = [];
@@ -697,6 +741,7 @@ app.get("/api/status", async (_, res) => {
       version: "2.6.0-KOYEB-DASHBOARD",
       aiConfigured: hasAiKey,
       activeSessionsCount: Array.from(sessions.values()).filter((s) => s.connected).length,
+      trainers: await loadAllTrainersList(),
       sessions: list,
       logs: recentLogs.slice().reverse(),
     });
@@ -790,7 +835,7 @@ app.get("/", (_, res) => {
     <h2>⚡ HULK FITNESS — مراقبة واتساب والربط واللوج (Koyeb)</h2>
     <div id="topMeta" class="row" style="font-size:13px;color:#a8c2ad;">جاري التحميل...</div>
     <div class="row">
-      <input id="trainerIdInput" placeholder="Trainer ID (مثال uid المدرب)" />
+      <select id="trainerSelect" onchange="onTrainerChange()" style="padding:9px 12px;border-radius:8px;border:1px solid #2c4231;background:#0a0f0b;color:#fff;font-size:13px;flex:1;min-width:190px;"><option value="">-- اختر المدرب --</option></select>
       <input id="phoneInput" placeholder="رقم واتساب بكود الدولة (مثال 2010...)" />
       <button onclick="pairNow()">ربط رقم / توليد كود</button>
       <button class="secondary" onclick="refreshAll()">تحديث الآن</button>
@@ -836,7 +881,7 @@ app.get("/", (_, res) => {
             const cls = s.status === "connected" ? "ok" : (s.status === "error" ? "err" : "warn");
             const num = s.connectedNumber && s.connectedNumber !== "-" ? s.connectedNumber : s.phoneNumber;
             return "<tr>" +
-              "<td style=font-family:monospace;font-size:11px>" + s.trainerId + "</td>" +
+              "<td><b>" + ((window.__hulkTrainersMap && window.__hulkTrainersMap[s.trainerId]) || s.trainerId) + "</b><div style=font-family:monospace;font-size:10px;color:#8aa390>" + s.trainerId + "</div></td>" +
               "<td>" + (num || "-") + "</td>" +
               "<td><span class=\"badge " + cls + "\">" + s.status + "</span>" + (s.error ? "<div style=color:#ff6b6b;font-size:11px>" + s.error + "</div>" : "") + "</td>" +
               "<td>" + (s.pairingCode ? "<span class=code>" + s.pairingCode + "</span>" : "-") + "</td>" +
@@ -852,8 +897,16 @@ app.get("/", (_, res) => {
       } catch (e) {}
     }
 
+    function onTrainerChange() {
+      const sel = document.getElementById("trainerSelect");
+      const pInp = document.getElementById("phoneInput");
+      if (!sel || !pInp) return;
+      const txt = sel.options[sel.selectedIndex]?.text || "";
+      const m = txt.match(/\(([^)]+)\)/);
+      if (m && m[1]) pInp.value = m[1].trim();
+    }
     async function pairNow() {
-      const trainerId = document.getElementById("trainerIdInput").value.trim();
+      const trainerId = document.getElementById("trainerSelect").value.trim();
       const phone = document.getElementById("phoneInput").value.trim();
       const msgEl = document.getElementById("actionMsg");
       msgEl.textContent = "جاري إرسال طلب الربط...";
