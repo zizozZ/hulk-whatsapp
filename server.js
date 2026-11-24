@@ -103,44 +103,97 @@ function isSamePhoneLoose(p1, p2) {
   return false;
 }
 
-async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
+async function buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJid = "") {
   const cleanSender = String(senderPhone || "").replace(/[^0-9]/g, "");
   let matchedTraineeDoc = null;
 
   try {
-    const [traineesSnap, usersSnap] = await Promise.all([
-      db.collection("trainees").get().catch(() => ({ docs: [] })),
-      db.collection("users").get().catch(() => ({ docs: [] })),
-    ]);
-
-    const getPhones = (d) => [d.phone, d.phoneNumber, d.mobile, d.whatsapp, d.waPhone, d.contactPhone].filter(Boolean);
-
-    let matchedUser = null;
-    for (const u of usersSnap.docs) {
-      const uData = u.data() || {};
-      if (getPhones(uData).some((ph) => isSamePhoneLoose(ph, cleanSender))) {
-        matchedUser = u;
-        break;
+    // 1. لو الـ remoteJid مربوط مسبقاً في whatsappSenderMap
+    if (remoteJid) {
+      const mapSnap = await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).get().catch(() => null);
+      if (mapSnap?.exists && mapSnap.data()?.traineeId) {
+        const savedTid = mapSnap.data().traineeId;
+        const tDoc = await db.collection("trainees").doc(savedTid).get().catch(() => null);
+        if (tDoc?.exists) matchedTraineeDoc = tDoc;
       }
     }
 
-    for (const t of traineesSnap.docs) {
-      const tData = t.data() || {};
-      const byPhone = getPhones(tData).some((ph) => isSamePhoneLoose(ph, cleanSender));
-      const byUser = matchedUser && (t.id === matchedUser.id || tData.userId === matchedUser.id || tData.uid === matchedUser.id);
-      if (byPhone || byUser) {
-        matchedTraineeDoc = t;
-        break;
+    // 2. مطابقة مباشرة بالرقم في trainees و users
+    if (!matchedTraineeDoc) {
+      const [traineesSnap, usersSnap] = await Promise.all([
+        db.collection("trainees").get().catch(() => ({ docs: [] })),
+        db.collection("users").get().catch(() => ({ docs: [] })),
+      ]);
+
+      const getPhones = (d) => [d.phone, d.phoneNumber, d.mobile, d.whatsapp, d.waPhone, d.contactPhone].filter(Boolean);
+
+      let matchedUser = null;
+      for (const u of usersSnap.docs) {
+        const uData = u.data() || {};
+        if (getPhones(uData).some((ph) => isSamePhoneLoose(ph, cleanSender))) {
+          matchedUser = u;
+          break;
+        }
+      }
+
+      for (const t of traineesSnap.docs) {
+        const tData = t.data() || {};
+        const byPhone = getPhones(tData).some((ph) => isSamePhoneLoose(ph, cleanSender));
+        const byUser = matchedUser && (t.id === matchedUser.id || tData.userId === matchedUser.id || tData.uid === matchedUser.id);
+        if (byPhone || byUser) {
+          matchedTraineeDoc = t;
+          break;
+        }
+      }
+
+      if (!matchedTraineeDoc && matchedUser) {
+        const uData = matchedUser.data() || {};
+        matchedTraineeDoc = {
+          id: matchedUser.id,
+          ref: matchedUser.ref,
+          data: () => ({ ...uData, fullName: uData.fullName || uData.name || pushName || "بطل" }),
+        };
       }
     }
 
-    if (!matchedTraineeDoc && matchedUser) {
-      const uData = matchedUser.data() || {};
-      matchedTraineeDoc = {
-        id: matchedUser.id,
-        ref: matchedUser.ref,
-        data: () => ({ ...uData, fullName: uData.fullName || uData.name || pushName || "بطل" }),
-      };
+    // 3. ربط فوري لو المتدرب ضغط زر "ربط واتساب" في صفحته خلال آخر 5 دقائق
+    if (!matchedTraineeDoc && remoteJid) {
+      const pendingSnap = await db.collection("whatsappPendingLinks").get().catch(() => ({ docs: [] }));
+      const nowMs = Date.now();
+      let latestPending = null;
+      for (const pd of pendingSnap.docs) {
+        const pData = pd.data() || {};
+        const createdMs = pData.requestedAt?.toMillis ? pData.requestedAt.toMillis() : (Number(pData.requestedAtMs) || 0);
+        if (createdMs && nowMs - createdMs <= 5 * 60 * 1000 && pData.traineeId) {
+          if (!latestPending || createdMs > latestPending.createdMs) {
+            latestPending = { doc: pd, traineeId: pData.traineeId, createdMs };
+          }
+        }
+      }
+      if (latestPending) {
+        const tDoc = await db.collection("trainees").doc(latestPending.traineeId).get().catch(() => null);
+        if (tDoc?.exists) {
+          matchedTraineeDoc = tDoc;
+          await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).set({
+            remoteJid,
+            traineeId: tDoc.id,
+            trainerId: tDoc.data()?.trainerId || trainerId,
+            linkedViaButton: true,
+            linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true }).catch(() => {});
+          await latestPending.doc.delete().catch(() => {});
+        }
+      }
+    }
+
+    // حفظ الربط لأي مطابقة ناجحة
+    if (matchedTraineeDoc && remoteJid && matchedTraineeDoc.id) {
+      await db.collection("whatsappSenderMap").doc(encodeURIComponent(remoteJid)).set({
+        remoteJid,
+        traineeId: matchedTraineeDoc.id,
+        trainerId: matchedTraineeDoc.data()?.trainerId || trainerId,
+        linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true }).catch(() => {});
     }
   } catch {}
 
@@ -188,7 +241,6 @@ async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
 
   return { traineeDoc: matchedTraineeDoc, contextText: summary };
 }
-
 async function askHulkGemini(userPrompt, contextInfo, history = []) {
   const apiKey = (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim();
   if (!apiKey) {
@@ -296,7 +348,7 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
 
     try {
       pushLog("INFO", "Incoming WA message", { trainerId, remoteJid, senderPhone, pushName, text: cleanText });
-      const { traineeDoc, contextText } = await buildFullTraineeContext(trainerId, senderPhone, pushName);
+      const { traineeDoc, contextText } = await buildFullTraineeContext(trainerId, senderPhone, pushName, remoteJid);
       pushLog("INFO", "Trainee lookup", traineeDoc ? { id: traineeDoc.id, fullName: traineeDoc.data().fullName, phone: traineeDoc.data().phone } : { matched: false, senderPhone });
       let finalContext = contextText;
 
