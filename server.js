@@ -36,6 +36,17 @@ function normalizePhone(raw) {
   return digits;
 }
 
+function phonesMatch(p1, p2) {
+  const a = normalizePhone(p1);
+  const b = normalizePhone(p2);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 10 && b.length >= 10) {
+    return a.slice(-10) === b.slice(-10);
+  }
+  return false;
+}
+
 function getCairoTimeInfo() {
   const now = new Date();
   const hour = Number(
@@ -60,23 +71,105 @@ async function getWaVersion() {
   return fallback.version;
 }
 
-// ==================== HULK GEMINI AI & FIRESTORE AUTO-COACH ====================
+// ==================== HULK GEMINI AI & FULL TRAINEE CONTEXT ====================
 const humanPauseMap = new Map();
 const chatMemoryMap = new Map();
+const incomingLocks = new Map();
+
+async function buildFullTraineeContext(trainerId, senderPhone, pushName) {
+  // 1. البحث في trainees
+  const traineesSnap = await db.collection('trainees').where('trainerId', '==', trainerId).get();
+  let matchedTraineeDoc = null;
+  for (const d of traineesSnap.docs) {
+    const data = d.data();
+    if (phonesMatch(data.phone, senderPhone) || phonesMatch(data.whatsapp, senderPhone)) {
+      matchedTraineeDoc = d;
+      break;
+    }
+  }
+
+  // 2. إذا لم يُعثر عليه في trainees، ابحث في users بنفس الرقم
+  if (!matchedTraineeDoc && senderPhone) {
+    const usersSnap = await db.collection('users').get();
+    for (const u of usersSnap.docs) {
+      const uData = u.data();
+      if (phonesMatch(uData.phone, senderPhone) || phonesMatch(uData.whatsapp, senderPhone)) {
+        const tDoc = await db.collection('trainees').doc(u.id).get();
+        if (tDoc.exists) {
+          matchedTraineeDoc = tDoc;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!matchedTraineeDoc) {
+    return {
+      traineeDoc: null,
+      contextText: `حالة الشخص: زائر جديد غير مسجل كمتدرب بعد (اسمه على واتساب: ${pushName || 'غير معروف'} | رقمه: ${senderPhone}). رحّب به، اسأله عن هدفه ووزنه وطوله، ووضح له باقات التدريب الأونلاين على منصة HULK FITNESS: https://hulk-fitness-9dbc0.web.app`,
+    };
+  }
+
+  const t = matchedTraineeDoc.data();
+  const traineeId = matchedTraineeDoc.id;
+
+  // جلب الخطة التدريبية، النظام الغذائي، وآخر القياسات
+  const [workoutsSnap, nutritionSnap, measurementsSnap] = await Promise.all([
+    db.collection('workoutPlans').where('traineeId', '==', traineeId).limit(1).get().catch(() => ({ docs: [] })),
+    db.collection('nutritionPlans').where('traineeId', '==', traineeId).limit(1).get().catch(() => ({ docs: [] })),
+    db.collection('bodyMeasurements').where('traineeId', '==', traineeId).limit(5).get().catch(() => ({ docs: [] })),
+  ]);
+
+  const workoutPlan = workoutsSnap.docs[0]?.data();
+  const nutritionPlan = nutritionSnap.docs[0]?.data();
+  const measurements = measurementsSnap.docs.map((m) => m.data());
+
+  let summary = `بيانات المتدرب المسجل في المنصة:
+- الاسم: ${t.fullName || pushName || 'بطل'}
+- الهدف: ${t.goal || 'بناء عضل وتحسين الفورمة'}
+- الطول: ${t.height ? t.height + ' سم' : 'غير مسجل'}
+- الوزن البدائي: ${t.startWeight ? t.startWeight + ' كجم' : 'غير مسجل'}
+- الوزن الحالي: ${t.currentWeight ? t.currentWeight + ' كجم' : 'غير مسجل'}
+- الوزن المستهدف: ${t.targetWeight ? t.targetWeight + ' كجم' : 'غير مسجل'}
+- مستوى الالتزام: ${t.complianceLevel || 'ممتاز'}
+- حالة الاشتراك: ${t.subscriptionStatus || t.status || 'نشط'}`;
+
+  if (workoutPlan) {
+    summary += `\n- البرنامج التدريبي الحالي: ${workoutPlan.title || workoutPlan.splitName || 'مخصص'} (${workoutPlan.daysPerWeek || ''} أيام أسبوعياً)`;
+  }
+  if (nutritionPlan) {
+    summary += `\n- النظام الغذائي الحالي: ${nutritionPlan.targetCalories || nutritionPlan.calories || ''} سعرة حرارية (بروتين: ${nutritionPlan.protein || ''}جم)`;
+  }
+  if (measurements.length > 0) {
+    const weightsList = measurements
+      .map((m) => m.weight)
+      .filter(Boolean)
+      .join(' -> ');
+    if (weightsList) summary += `\n- سجل الأوزان المسجل: ${weightsList} كجم`;
+  }
+
+  return { traineeDoc: matchedTraineeDoc, contextText: summary };
+}
 
 async function askHulkGemini(userPrompt, contextInfo, history = []) {
   const apiKey = (process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || '').trim();
   if (!apiKey) {
-    throw new Error('مفتاح GEMINI_API_KEY غير مضاف في إعدادات Environment Variables على Koyeb');
+    throw new Error('مفتاح GEMINI_API_KEY غير مضاف في إعدادات Koyeb');
   }
 
   const systemInstruction = `أنت المساعد الذكي الرسمي لكابتن هالك (كوتش زياد طارق - Cap Ziad) على واتساب ومنصة HULK FITNESS.
-أسلوبك: مصري رياضي، محفّز، ودود، محترف، ومختصر (3 إلى 5 سطور بالكتير إلا لو طلب شرح تمرين أو وجبة).
-قواعد مهمة:
-- لو المتدرب مشترك بالفعل، ناديه باسمه وشجعه بناءً على بياناته من المنصة: ${contextInfo}
-- لو زائر جديد بيسأل عن التدريب الأونلاين أو البرايفت أو الأسعار، رحّب بيه بحماس، اسأله عن هدفه ووزنه وطوله، ووضحله إن الباقات بتشمل برنامج تمرين وتغذية مخصص ومتابعة أسبوعية على منصة HULK PRO، وابعتله رابط المنصة: https://hulk-fitness-9dbc0.web.app
-- ممنوع ترشح الشوفان أو الواي بروتين في أي اقتراح غذائي.
-- لو المتدرب ذكر وزنه الجديد في رسالته، أكدله إنك سجلت الوزن الجديد في حسابه على المنصة بنجاح.`;
+تحدث باللهجة المصرية الرياضية الودودة والمحفزة بأسلوب كابتن ذياد.
+
+معلومات الشخص الذي يراسلك الآن:
+${contextInfo}
+
+تعليمات صارمة:
+1. اكتب رداً كاملاً ومفيداً ومباشراً في رسالة واحدة مترابطة (لا تقطع الجملة أبداً).
+2. إذا كان الشخص متدرباً مسجلاً في المنصة:
+   - ناديه باسمه الحقيقي مباشرة ولا تعامله كزائر جديد ولا تسأله عن وزنه وطوله إذا كانت مسجلة بالفعل في بياناته أعلاه!
+   - قيّم تطوره بناءً على وزنه البدائي والحالي والمستهدف والتزامه، وشجعه بذكاء.
+3. إذا ذكر المتدرب وزنه الجديد، أكد له أنه تم تحديث وزنه في حسابه على المنصة بنجاح.
+4. ممنوع ترشيح الشوفان أو الواي بروتين في أي اقتراح غذائي.`;
 
   const contents = [
     ...history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
@@ -96,7 +189,11 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: systemInstruction }] },
             contents,
-            generationConfig: { temperature: 0.7, maxOutputTokens: 450 },
+            generationConfig: {
+              temperature: 0.65,
+              maxOutputTokens: 2048,
+              thinkingConfig: { thinkingBudget: 0 },
+            },
           }),
         }
       );
@@ -105,10 +202,11 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
         lastError = `[${model}] ` + (data?.error?.message || `HTTP ${res.status}`);
         continue;
       }
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (reply) return reply.trim();
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const reply = parts.map((p) => p.text || '').join('').trim();
+      if (reply) return reply;
     } catch (err) {
-      lastError = err?.message || String(err);
+      lastError = `[${model}] ` + (err?.message || String(err));
     }
   }
 
@@ -119,10 +217,13 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
   try {
     if (!msg?.message || msg.key?.remoteJid === 'status@broadcast') return;
     const remoteJid = msg.key.remoteJid || '';
-    if (remoteJid.endsWith('@g.us')) return; // تجاهل الجروبات فقط
+    if (remoteJid.endsWith('@g.us')) return;
 
-    const rawId = (msg.key.participant || remoteJid).split('@')[0];
-    const senderPhone = normalizePhone(rawId);
+    // استخراج رقم الهاتف الحقيقي حتى لو كان الحساب بصيغة @lid
+    const rawJid = msg.key.senderPn || msg.key.participant || remoteJid;
+    const senderPhone = normalizePhone(rawJid.split('@')[0]);
+    const pushName = msg.pushName || '';
+
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -142,79 +243,78 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
         humanPauseMap.delete(pauseKey);
         return;
       }
-      humanPauseMap.set(pauseKey, Date.now() + 2 * 60 * 60 * 1000);
+      // تجاهل الرسائل التي أرسلها البوت نفسه (تحتوي على علامات معينة) أو إيقاف البوت إذا رد الكوتش يدوياً
+      if (!msg.key.id?.startsWith('BAE5') && !msg.key.id?.startsWith('3EB0')) {
+        humanPauseMap.set(pauseKey, Date.now() + 2 * 60 * 60 * 1000);
+      }
       return;
     }
 
     const pausedUntil = humanPauseMap.get(pauseKey) || 0;
     if (Date.now() < pausedUntil) return;
 
-    const traineesSnap = await db
-      .collection('trainees')
-      .where('trainerId', '==', trainerId)
-      .get();
-
-    let matchedTraineeDoc = null;
-    for (const d of traineesSnap.docs) {
-      const tPhone = normalizePhone(d.data().phone || '');
-      if (tPhone && senderPhone && (tPhone === senderPhone || tPhone.endsWith(senderPhone.slice(-10)))) {
-        matchedTraineeDoc = d;
-        break;
-      }
+    // منع تداخل الردود لنفس المحادثة في نفس الثانية
+    if (incomingLocks.get(pauseKey)) {
+      await sleep(2500);
     }
+    incomingLocks.set(pauseKey, true);
 
-    let contextInfo = 'زائر جديد غير مسجل بعد في المنصة.';
-    if (matchedTraineeDoc) {
-      const t = matchedTraineeDoc.data();
-      contextInfo = `متدرب مشترك اسمه: ${t.fullName} | الهدف: ${t.goal || 'لياقة وبناء عضل'} | الوزن الحالي: ${t.currentWeight || 'غير محدد'} كجم | الوزن المستهدف: ${t.targetWeight || 'غير محدد'} كجم | حالة الاشتراك: ${t.subscriptionStatus || 'Active'}`;
+    try {
+      const { traineeDoc, contextText } = await buildFullTraineeContext(trainerId, senderPhone, pushName);
+      let finalContext = contextText;
 
-      const weightMatch = cleanText.match(/(?:وزني|الوزن|وزن)[^0-9]{0,12}(\d{2,3}(?:\.\d{1,2})?)/i);
-      if (weightMatch) {
-        const newWeight = parseFloat(weightMatch[1]);
-        if (newWeight >= 35 && newWeight <= 250) {
-          await matchedTraineeDoc.ref.update({
-            currentWeight: newWeight,
-            lastWeightAt: admin.firestore.FieldValue.serverTimestamp(),
-            lastUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          await db.collection('measurements').add({
-            traineeId: matchedTraineeDoc.id,
-            trainerId,
-            weight: newWeight,
-            source: 'whatsapp_ai',
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          }).catch(() => {});
-          contextInfo += ` (تم تحديث وزنه الآن في الموقع إلى ${newWeight} كجم)`;
+      if (traineeDoc) {
+        const weightMatch = cleanText.match(/(?:وزني|الوزن|وزن|بقيت|وصلت)[^0-9]{0,12}(\d{2,3}(?:\.\d{1,2})?)/i);
+        if (weightMatch) {
+          const newWeight = parseFloat(weightMatch[1]);
+          if (newWeight >= 35 && newWeight <= 250) {
+            await traineeDoc.ref.update({
+              currentWeight: newWeight,
+              lastWeightAt: admin.firestore.FieldValue.serverTimestamp(),
+              lastUpdateAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await db.collection('bodyMeasurements').add({
+              traineeId: traineeDoc.id,
+              trainerId,
+              weight: newWeight,
+              source: 'whatsapp_ai',
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            }).catch(() => {});
+            finalContext += `\n(ملاحظة هامة: تم تسجيل تحديث وزنه الجديد إلى ${newWeight} كجم في المنصة الآن)`;
+          }
         }
+      } else if (senderPhone) {
+        await db.collection('whatsappLeads').doc(senderPhone).set(
+          {
+            trainerId,
+            phone: senderPhone,
+            name: pushName,
+            lastMessage: cleanText,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        ).catch(() => {});
       }
-    } else if (senderPhone) {
-      await db.collection('whatsappLeads').doc(senderPhone).set(
-        {
-          trainerId,
-          phone: senderPhone,
-          lastMessage: cleanText,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      ).catch(() => {});
+
+      const history = chatMemoryMap.get(pauseKey) || [];
+      const aiReply = await askHulkGemini(cleanText, finalContext, history);
+      if (!aiReply) return;
+
+      const updatedHistory = [
+        ...history.slice(-6),
+        { role: 'user', text: cleanText },
+        { role: 'model', text: aiReply },
+      ];
+      chatMemoryMap.set(pauseKey, updatedHistory);
+
+      await sock.presenceSubscribe(remoteJid).catch(() => {});
+      await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+      await sleep(Math.min(3000, Math.max(1200, aiReply.length * 15)));
+      await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+      await sock.sendMessage(remoteJid, { text: aiReply });
+    } finally {
+      incomingLocks.delete(pauseKey);
     }
-
-    const history = chatMemoryMap.get(pauseKey) || [];
-    const aiReply = await askHulkGemini(cleanText, contextInfo, history);
-    if (!aiReply) return;
-
-    const updatedHistory = [
-      ...history.slice(-4),
-      { role: 'user', text: cleanText },
-      { role: 'model', text: aiReply },
-    ];
-    chatMemoryMap.set(pauseKey, updatedHistory);
-
-    await sock.presenceSubscribe(remoteJid).catch(() => {});
-    await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
-    await sleep(Math.min(3500, Math.max(1500, aiReply.length * 25)));
-    await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
-    await sock.sendMessage(remoteJid, { text: aiReply });
   } catch (err) {
     console.error('Incoming WA AI handler error:', err?.message || err);
   }
@@ -539,7 +639,6 @@ db.collection('whatsappQueue')
     });
   });
 
-// مستمع اختبار Gemini AI المباشر من لوحة المدرب
 db.collection('whatsappAiTests')
   .where('status', '==', 'pending')
   .onSnapshot((snap) => {
@@ -560,10 +659,10 @@ const hasAiKey = Boolean((process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_
 app.get('/', (_, res) =>
   res.json({
     status: 'HULK WhatsApp Web Service Running',
-    version: '2.1.0-AI',
+    version: '2.2.0-AI-FULL',
     aiConfigured: hasAiKey,
     activeSessions: sessions.size,
   })
 );
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.1.0 running on port ${PORT} | Gemini AI Key: ${hasAiKey ? 'OK' : 'MISSING'}`));
+app.listen(PORT, () => console.log(`🚀 WhatsApp Web Backend v2.2.0 running on port ${PORT} | Gemini AI Key: ${hasAiKey ? 'OK' : 'MISSING'}`));
