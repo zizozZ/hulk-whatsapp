@@ -356,27 +356,38 @@ async function startWhatsAppSession(trainerId, phoneNumber, requestPairing = fal
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    if (qr && requestPairing && !sock.authState.creds.registered && !pairingCodeRequested) {
+    if ((qr || connection === "connecting") && requestPairing && !sock.authState.creds.registered && !pairingCodeRequested) {
       pairingCodeRequested = true;
       setTimeout(async () => {
         try {
+          if (sock.authState.creds.registered) return;
           const rawCode = await sock.requestPairingCode(cleanPhone);
-          const formatted = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-          await db.collection('whatsappSessions').doc(trainerId).set(
+          const formatted = rawCode?.match(/.{1,4}/g)?.join("-") || rawCode;
+          await db.collection("whatsappSessions").doc(trainerId).set(
             {
               trainerId,
               phoneNumber: cleanPhone,
-              status: 'waiting_for_code',
+              status: "waiting_for_code",
               pairingCode: formatted,
               error: null,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true }
           );
-        } catch {
+        } catch (err) {
           pairingCodeRequested = false;
+          if (retryCount >= 2) {
+            await db.collection("whatsappSessions").doc(trainerId).set(
+              {
+                status: "error",
+                error: "فشل توليد الكود من واتساب: " + (err?.message || "تأكد من صيغة الرقم بكود الدولة"),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
         }
-      }, 1000);
+      }, 2500);
     }
 
     if (connection === 'open') {
@@ -581,8 +592,8 @@ db.collection('whatsappSessions').onSnapshot((snap) => {
       existing.autoMotivationEnabled = data.autoMotivationEnabled;
     }
 
-    if (data.status === 'pairing_requested' && data.phoneNumber) {
-      await db.collection('whatsappSessions').doc(trainerId).update({ status: 'generating_code' });
+    if ((data.status === "pairing_requested" || (data.status === "generating_code" && !existing)) && data.phoneNumber) {
+      await db.collection("whatsappSessions").doc(trainerId).update({ status: "generating_code" });
       await startWhatsAppSession(trainerId, data.phoneNumber, true, 0);
     } else if (data.status === 'disconnect_requested') {
       if (existing?.sock) {
