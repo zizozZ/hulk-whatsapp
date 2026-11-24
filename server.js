@@ -83,7 +83,7 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
     { role: 'user', parts: [{ text: userPrompt }] },
   ];
 
-  const models = ['gemini-3.0-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  const models = ['gemini-2.5-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash-lite'];
   let lastError = 'Unknown Gemini Error';
 
   for (const model of models) {
@@ -102,7 +102,7 @@ async function askHulkGemini(userPrompt, contextInfo, history = []) {
       );
       const data = await res.json();
       if (!res.ok) {
-        lastError = data?.error?.message || `HTTP ${res.status}`;
+        lastError = `[${model}] ` + (data?.error?.message || `HTTP ${res.status}`);
         continue;
       }
       const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
