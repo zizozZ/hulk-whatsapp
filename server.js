@@ -252,7 +252,9 @@ async function handleIncomingWhatsAppMessage(trainerId, sock, msg) {
     incomingLocks.set(pauseKey, true);
 
     try {
+      console.log("📩 WA Incoming:", { remoteJid, participant: msg.key.participant, senderPn: msg.key.senderPn, senderPhone, pushName, text: cleanText });
       const { traineeDoc, contextText } = await buildFullTraineeContext(trainerId, senderPhone, pushName);
+      console.log("👤 Matched trainee:", traineeDoc ? { id: traineeDoc.id, fullName: traineeDoc.data().fullName, phone: traineeDoc.data().phone, trainerId: traineeDoc.data().trainerId } : null);
       let finalContext = contextText;
 
       if (traineeDoc) {
